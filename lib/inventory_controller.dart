@@ -1,13 +1,12 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
-import 'package:rfid_03/uhf/uhf_adapter.dart';
+import 'uhf/uhf_adapter.dart';
 
 class TagRow {
   final String epc;
   int count;
   int lastRssi;
   DateTime lastSeen;
-
   TagRow({
     required this.epc,
     required this.count,
@@ -17,8 +16,7 @@ class TagRow {
 }
 
 class _PendingAgg {
-  int cnt;
-  int rssi;
+  int cnt, rssi;
   DateTime last;
   _PendingAgg({required this.cnt, required this.rssi, required this.last});
 }
@@ -36,14 +34,13 @@ class InventoryController extends ChangeNotifier {
 
   final Map<String, TagRow> _tagRows = {};
   final Map<String, _PendingAgg> _pending = {};
-
   List<TagRow> _sortedRowsCache = [];
   bool _isCacheDirty = true;
 
   int _totalHitCount = 0;
   DateTime? _startTime;
-
   Timer? _flushUiTimer;
+  static const _flushEvery = Duration(milliseconds: 12); // ~80 fps
 
   List<TagRow> get rows {
     if (_isCacheDirty) {
@@ -62,7 +59,6 @@ class InventoryController extends ChangeNotifier {
 
   void _onTagHit(TagHitNative hit) {
     if (!_isRunning || hit.epc.isEmpty) return;
-
     final now = DateTime.now();
     final agg = _pending.putIfAbsent(
       hit.epc,
@@ -71,15 +67,12 @@ class InventoryController extends ChangeNotifier {
     agg.cnt++;
     agg.rssi = hit.rssi;
     agg.last = now;
-
-    // jadwalkan flush UI (coalesced)
     _flushUiTimer ??= Timer(_flushEvery, _applyPending);
   }
 
   void _applyPending() {
     _flushUiTimer?.cancel();
     _flushUiTimer = null;
-
     if (_pending.isEmpty) return;
     _pending.forEach((epc, agg) {
       final row = _tagRows.putIfAbsent(
@@ -93,12 +86,9 @@ class InventoryController extends ChangeNotifier {
       _totalHitCount += agg.cnt;
     });
     _pending.clear();
-
     _isCacheDirty = true;
     notifyListeners();
   }
-
-  static const _flushEvery = Duration(milliseconds: 12); // ~80 fps
 
   Future<void> start() async {
     if (_isRunning) return;
@@ -106,9 +96,9 @@ class InventoryController extends ChangeNotifier {
     _startTime ??= DateTime.now();
     notifyListeners();
     try {
-      await adapter.setPower(30); // 28–30 dBm kalau modul sanggup
+      await adapter.setPower(30); // maksimal kalau modul mendukung
       await adapter.startInventory();
-    } catch (e) {
+    } catch (_) {
       _isRunning = false;
       notifyListeners();
     }

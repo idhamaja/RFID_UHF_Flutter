@@ -4,11 +4,11 @@ import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
-import android.os.Process;
 
 import androidx.annotation.NonNull;
 
@@ -17,9 +17,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
 
 import io.flutter.embedding.android.FlutterActivity;
 import io.flutter.embedding.engine.FlutterEngine;
@@ -32,19 +32,21 @@ public class MainActivity extends FlutterActivity {
   private static final String EVENT_CH = "uhf/tags";
   private static final String TAG = "UHF";
 
-  // ==== tuning anti-ANR ====
-  private static final int CACHE_LIMIT = 6000;
-  private static final int PUSH_GAP_MS = 10; // ~100 fps
-  private static final int PUSH_CHUNK = 96; // max item per tick
-  private static final int READER_IDLE_MS = 4; // tidur saat idle
-  private static final int[] SERIAL_BAUDS = new int[] { 921600, 460800, 230400, 115200 };
-  private boolean pushPosted = false;
+  // ==== Tuning anti-ANR / backpressure ====
+  private static final int CACHE_LIMIT = 4000; // batasi buffer event
+  private static final int PUSH_GAP_MS = 30; // kirim batch tiap ~33 fps
+  private static final int PUSH_CHUNK = 64; // max item per batch
+  private static final int READER_IDLE_MS = 6; // tidur singkat saat idle
 
-  private boolean isBeepEnabled = true;
-  private boolean isVibrateEnabled = true;
+  private static final int BEEP_GAP_MS = 150; // throttle beep
+  private static final int VIB_GAP_MS = 180; // throttle vibrate
 
   private final Handler main = new Handler(Looper.getMainLooper());
   private EventChannel.EventSink sink;
+
+  private boolean pushPosted = false;
+  private boolean isBeepEnabled = true;
+  private boolean isVibrateEnabled = true;
 
   private Object uhfMgr;
   private Object uhfFunc;
@@ -57,15 +59,14 @@ public class MainActivity extends FlutterActivity {
   private volatile boolean running = false;
 
   private Thread readerThread;
-  private boolean methodsDumped = false; // debug sekali saja
+  private boolean methodsDumped = false;
 
-  // tone reuse + throttle
+  // Beep/vibrate reuse + throttle
   private ToneGenerator toneGen;
   private long lastBeepAt = 0L;
   private long lastVibrateAt = 0L;
   private long lastPushAt = 0L;
 
-  // ---------------- Lifecycle ----------------
   @Override
   public void configureFlutterEngine(@NonNull FlutterEngine engine) {
     super.configureFlutterEngine(engine);
@@ -84,15 +85,12 @@ public class MainActivity extends FlutterActivity {
                 result.success(null);
                 break;
 
-              case "pullBatch": {
-                // 1) baca langsung dari SDK (jalur “pull” yang murah)
+              case "pullBatch": { // polling fallback ringan
                 List<Map<String, Object>> out = readBatchOnce();
-                // 2) sekalian sedot semua yang sempat nyangkut di cache event
                 out.addAll(drainTagCache());
-                // feedback haptic/audio sekali saja per batch (optional)
                 if (!out.isEmpty()) {
                   safeBeep();
-                  safeVibrate(30);
+                  safeVibrate(20);
                 }
                 result.success(out);
                 break;
@@ -102,7 +100,7 @@ public class MainActivity extends FlutterActivity {
                 Map<String, Object> one = pullOneTagOnce();
                 if (one != null) {
                   safeBeep();
-                  safeVibrate(30);
+                  safeVibrate(20);
                 }
                 result.success(one);
                 break;
@@ -118,7 +116,6 @@ public class MainActivity extends FlutterActivity {
               case "setBeep": {
                 Boolean b = call.argument("enabled");
                 isBeepEnabled = b != null && b;
-                Log.d(TAG, "setBeep -> " + isBeepEnabled);
                 result.success(null);
                 break;
               }
@@ -126,7 +123,6 @@ public class MainActivity extends FlutterActivity {
               case "setVibrate": {
                 Boolean v = call.argument("enabled");
                 isVibrateEnabled = v != null && v;
-                Log.d(TAG, "setVibrate -> " + isVibrateEnabled);
                 result.success(null);
                 break;
               }
@@ -159,7 +155,7 @@ public class MainActivity extends FlutterActivity {
         });
   }
 
-  // ---------------- Beep/Vibrate (reused + throttled) ----------------
+  // --------- Beep / Vibrate (reused + throttled) ----------
   private void safeBeep() {
     if (!isBeepEnabled)
       return;
@@ -167,7 +163,6 @@ public class MainActivity extends FlutterActivity {
     if (now - lastBeepAt < BEEP_GAP_MS)
       return;
     lastBeepAt = now;
-
     try {
       if (toneGen == null)
         toneGen = new ToneGenerator(AudioManager.STREAM_MUSIC, 80);
@@ -184,7 +179,6 @@ public class MainActivity extends FlutterActivity {
     if (now - lastVibrateAt < VIB_GAP_MS)
       return;
     lastVibrateAt = now;
-
     try {
       Vibrator vib = (Vibrator) getSystemService(VIBRATOR_SERVICE);
       if (vib == null)
@@ -208,9 +202,14 @@ public class MainActivity extends FlutterActivity {
       Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
       while (running) {
         try {
+          // beberapa SDK perlu dipicu agar buffer/log terisi
+          tryCall(uhfFunc, "GetRFIDInventoryBankDataTogether");
+          tryCall(uhfMgr, "GetRFIDInventoryBankDataTogether");
+          tryCall(gClient, "GetRFIDInventoryBankDataTogether");
+
           int drained = drainAllTagsOnce();
           if (drained == 0)
-            Thread.sleep(READER_IDLE_MS); // 3–6 ms bagus
+            Thread.sleep(READER_IDLE_MS);
         } catch (InterruptedException ie) {
           break;
         } catch (Throwable t) {
@@ -226,66 +225,25 @@ public class MainActivity extends FlutterActivity {
     readerThread.start();
   }
 
-  // panggil banyak variasi nama method; kalau tidak ada, auto-skip
-  private void callBool(Object h, String... names) {
-    for (String n : names)
-      tryCall(h, n, true);
-  }
-
-  private void callFalse(Object h, String... names) {
-    for (String n : names)
-      tryCall(h, n, false);
-  }
-
-  private void callInt(Object h, int v, String... names) {
-    for (String n : names)
-      tryCall(h, n, v);
-  }
-
-  private void tuneForSpeed() {
-    Object[] H = new Object[] { uhfFunc, uhfMgr, gClient };
-    for (Object h : H)
-      if (h != null) {
-        // EPC only, no TID/USER
-        callFalse(h, "setReadTid", "readTid", "setReadUser");
-        callInt(h, 1, "setBankEnable"); // 1=EPC (vendor)
-        callInt(h, 0, "setInventoryMode", "setMode"); // 0=EPC-only
-
-        // Continuous / fast inventory
-        callInt(h, 1, "setWorkMode", "setWorkingMode", "setInventoryContinue");
-        callBool(h, "setContinuousMode");
-        callInt(h, 0, "setSpeed"); // 0=fast (vendor)
-        callFalse(h, "setBeeper"); // matikan beep SDK
-
-        // Anti-collision cepat
-        callInt(h, 0, "setSession", "SetSession"); // S0
-        callInt(h, 0, "setTarget", "SetTarget"); // A/0
-        callInt(h, 4, "setQ", "SetQValue"); // start Q=4 (dinamis nyala)
-        callBool(h, "setDynamicQ");
-
-        // Link profile cepat (abaikan jika tak ada)
-        callInt(h, 2, "setProfile", "setLinkProfile"); // profil cepat
-        callInt(h, 640, "setDR");
-        callInt(h, 2, "setM"); // Miller-2
-      }
-    Log.d(TAG, "tuneForSpeed applied");
-  }
-
   private void startInventory() throws Exception {
     ensureReady();
+
     if (!methodsDumped) {
       dumpAllMethods("uhfMgr", uhfMgr);
       dumpAllMethods("uhfFunc", uhfFunc);
       dumpAllMethods("gClient", gClient);
       methodsDumped = true;
     }
-    tryRegisterCallbacks();
-    tuneForSpeed(); // << penting
 
-    // start (nama berbeda-beda antar SDK)
-    if (!invokeAny(uhfFunc, "startInventoryTag") && !invokeAny(uhfFunc, "inventoryStart")
-        && !invokeAny(uhfFunc, "startRead") && !invokeAny(uhfMgr, "startInventoryTag")
-        && !invokeAny(uhfMgr, "inventoryStart") && !invokeAny(uhfMgr, "startRead")) {
+    tryRegisterCallbacks();
+    tuneForSpeed();
+
+    if (!invokeAny(uhfFunc, "startInventoryTag")
+        && !invokeAny(uhfFunc, "inventoryStart")
+        && !invokeAny(uhfFunc, "startRead")
+        && !invokeAny(uhfMgr, "startInventoryTag")
+        && !invokeAny(uhfMgr, "inventoryStart")
+        && !invokeAny(uhfMgr, "startRead")) {
       Log.w(TAG, "No startInventory method found");
     } else {
       Log.d(TAG, "Inventory started");
@@ -293,15 +251,6 @@ public class MainActivity extends FlutterActivity {
 
     running = true;
     startReaderLoop();
-
-    // prime awal agar UI langsung isi
-    List<Map<String, Object>> prim = readBatchOnce();
-    if (!prim.isEmpty()) {
-      synchronized (tagCache) {
-        tagCache.addAll(prim);
-      }
-      schedulePush();
-    }
   }
 
   private void stopInventory() {
@@ -430,31 +379,24 @@ public class MainActivity extends FlutterActivity {
 
       boolean ok = false;
       try {
+        // prefer signature (String,int)
         Method open2 = gClz.getMethod("openAndroidSerial", String.class, int.class);
         String[] nodes = new String[] { "/dev/ttyS4", "/dev/ttyS3", "/dev/ttyHSL0", "/dev/ttyMT2" };
-        outer: for (int baud : SERIAL_BAUDS) {
-          for (String n : nodes) {
-            try {
-              open2.invoke(gClient, n, baud);
-              ok = true;
-              Log.d(TAG, "openAndroidSerial(" + n + ", " + baud + ") OK");
-              break outer;
-            } catch (Throwable ignore) {
-            }
+        for (String n : nodes) {
+          try {
+            open2.invoke(gClient, n, 115200);
+            ok = true;
+            Log.d(TAG, "openAndroidSerial(" + n + ") OK");
+            break;
+          } catch (Throwable ignore) {
           }
         }
       } catch (NoSuchMethodException ignore) {
         try {
           Method open1 = gClz.getMethod("openAndroidSerial", int.class);
-          for (int baud : SERIAL_BAUDS) {
-            try {
-              open1.invoke(gClient, baud);
-              ok = true;
-              Log.d(TAG, "openAndroidSerial(" + baud + ") OK");
-              break;
-            } catch (Throwable ignore2) {
-            }
-          }
+          open1.invoke(gClient, 115200);
+          ok = true;
+          Log.d(TAG, "openAndroidSerial(115200) OK");
         } catch (NoSuchMethodException e2) {
           Log.w(TAG, "GClient.openAndroidSerial not found");
         }
@@ -475,7 +417,7 @@ public class MainActivity extends FlutterActivity {
           (proxy, method, args) -> {
             if ("log".equals(method.getName()) && args != null && args.length >= 1) {
               Object info = args[args.length - 1];
-              publishTagFromInfo(info); // beep/vibrate di publish (throttled)
+              publishTagFromInfo(info);
             }
             return null;
           });
@@ -520,7 +462,7 @@ public class MainActivity extends FlutterActivity {
     return false;
   }
 
-  // jadwalkan pengiriman LIST (bukan per-item) tiap ~10ms
+  // ------ Batch push ke Flutter (anti-ANR) ------
   private void schedulePush() {
     if (sink == null || pushPosted)
       return;
@@ -543,11 +485,14 @@ public class MainActivity extends FlutterActivity {
         lastPushAt = SystemClock.uptimeMillis();
         try {
           sink.success(batch);
-          safeBeep();
-          safeVibrate(12);
         } catch (Throwable t) {
           Log.w(TAG, "push batch error", t);
         }
+        safeBeep();
+        safeVibrate(12);
+        // masih ada sisa? jadwalkan lagi
+        if (!tagCache.isEmpty())
+          schedulePush();
       }
     }, delay);
   }
@@ -555,10 +500,30 @@ public class MainActivity extends FlutterActivity {
   // ---------------- Batch read (pullBatch) ----------------
   private List<Map<String, Object>> readBatchOnce() {
     List<Map<String, Object>> out = new ArrayList<>();
+
     drainToListBySinglePop(uhfFunc, out);
     drainToListBySinglePop(uhfMgr, out);
+
     drainToListByList(uhfFunc, out);
     drainToListByList(uhfMgr, out);
+
+    if (out.isEmpty()) { // hanya kalau jalur cepat kosong
+      drainToListByTextLog(uhfFunc, out);
+      drainToListByTextLog(uhfMgr, out);
+      drainToListByTextLog(gClient, out);
+    }
+
+    if (out.isEmpty()) {
+      drainToListByRawBuffer(uhfFunc, out);
+      drainToListByRawBuffer(uhfMgr, out);
+      drainToListByRawBuffer(gClient, out);
+    }
+
+    if (out.isEmpty()) {
+      bruteForceDrain(uhfFunc, out);
+      bruteForceDrain(uhfMgr, out);
+      bruteForceDrain(gClient, out);
+    }
     return out;
   }
 
@@ -600,8 +565,7 @@ public class MainActivity extends FlutterActivity {
       } else if (list.getClass().isArray()) {
         int len = java.lang.reflect.Array.getLength(list);
         for (int i = 0; i < len; i++) {
-          Object tag = java.lang.reflect.Array.get(list, i);
-          Map<String, Object> m = mapFromInfo(tag);
+          Map<String, Object> m = mapFromInfo(java.lang.reflect.Array.get(list, i));
           if (m != null)
             out.add(m);
         }
@@ -609,29 +573,43 @@ public class MainActivity extends FlutterActivity {
     }
   }
 
+  // Ambil SEMUA EPC yang muncul di string log
   private void drainToListByTextLog(Object host, List<Map<String, Object>> out) {
     if (host == null)
       return;
     String[] names = new String[] {
         "readEpcLog", "readTagText", "readLog", "getTagEpcLog",
-        "getEpcTxt", "getLogString", "getLog"
+        "getEpcTxt", "getLogString", "getLog", "GetRFIDInventoryBankDataTogether"
     };
     for (String n : names) {
       Object v = tryCall(host, n);
-      if (v instanceof String) {
-        Map<String, Object> m = mapFromInfo(v);
-        if (m != null)
-          out.add(m);
-      }
+      if (v instanceof String)
+        out.addAll(mapsFromTextAll((String) v));
     }
+  }
+
+  private List<Map<String, Object>> mapsFromTextAll(String s) {
+    List<Map<String, Object>> list = new ArrayList<>();
+    if (s == null || s.isEmpty())
+      return list;
+    java.util.regex.Matcher m = java.util.regex.Pattern
+        .compile("([A-Fa-f0-9]{20,})")
+        .matcher(s);
+    Integer rssi = parseRssiFromText(s);
+    while (m.find()) {
+      String epc = m.group(1).toUpperCase();
+      Map<String, Object> map = new HashMap<>();
+      map.put("epc", epc);
+      map.put("rssi", rssi == null ? -70 : rssi);
+      list.add(map);
+    }
+    return list;
   }
 
   private void drainToListByRawBuffer(Object host, List<Map<String, Object>> out) {
     if (host == null)
       return;
-    String[] names = new String[] {
-        "readBuffer", "getBuffer", "getReadBuf", "readTagBuffer", "getInventoryBuffer"
-    };
+    String[] names = new String[] { "readBuffer", "getBuffer", "getReadBuf", "readTagBuffer", "getInventoryBuffer" };
     for (String n : names) {
       Object v = tryCall(host, n);
       if (v == null)
@@ -650,13 +628,11 @@ public class MainActivity extends FlutterActivity {
         continue;
 
       String text = new String(buf);
-      Map<String, Object> m = mapFromInfo(text);
-      if (m != null)
-        out.add(m);
+      out.addAll(mapsFromTextAll(text));
     }
   }
 
-  // Brute-force mahal: panggil terakhir saja
+  // Brute-force terakhir (mahal)
   private void bruteForceDrain(Object host, List<Map<String, Object>> out) {
     if (host == null)
       return;
@@ -668,15 +644,12 @@ public class MainActivity extends FlutterActivity {
         if (!(mn.contains("tag") || mn.contains("epc") || mn.contains("buf") || mn.contains("log")))
           continue;
 
-        m.setAccessible(true);
         Object v = m.invoke(host);
         if (v == null)
           continue;
 
         if (v instanceof String) {
-          Map<String, Object> map = mapFromInfo(v);
-          if (map != null)
-            out.add(map);
+          out.addAll(mapsFromTextAll((String) v));
           continue;
         }
         if (v instanceof List) {
@@ -837,12 +810,10 @@ public class MainActivity extends FlutterActivity {
         Object list = tryCall(uhfFunc, "getTagList");
         if (list == null)
           list = tryCall(uhfMgr, "getTagList");
-        if (list instanceof List && !((List<?>) list).isEmpty()) {
+        if (list instanceof List && !((List<?>) list).isEmpty())
           info = ((List<?>) list).get(0);
-        } else if (list != null && list.getClass().isArray()
-            && java.lang.reflect.Array.getLength(list) > 0) {
+        else if (list != null && list.getClass().isArray() && java.lang.reflect.Array.getLength(list) > 0)
           info = java.lang.reflect.Array.get(list, 0);
-        }
       }
       return mapFromInfo(info);
     } catch (Throwable t) {
@@ -862,22 +833,8 @@ public class MainActivity extends FlutterActivity {
         tagCache.subList(0, CACHE_LIMIT / 2).clear();
       }
     }
-
-    // kirim ke Flutter tapi dibatasi fps
-    if (sink == null)
-      return;
-    long now = SystemClock.uptimeMillis();
-    if (now - lastPushAt < PUSH_GAP_MS)
-      return;
-    lastPushAt = now;
-
-    main.post(() -> {
-      if (sink != null)
-        schedulePush();
-      // feedback kecil saat event (throttled)
-      safeBeep();
-      safeVibrate(20);
-    });
+    if (sink != null)
+      schedulePush(); // kirim batch di tick berikutnya
   }
 
   private List<Map<String, Object>> drainTagCache() {
@@ -938,8 +895,8 @@ public class MainActivity extends FlutterActivity {
       f.setAccessible(true);
       return f.get(target);
     } catch (Throwable ignored) {
+      return null;
     }
-    return null;
   }
 
   private String extractString(Object obj, String[] getters) {
@@ -970,8 +927,38 @@ public class MainActivity extends FlutterActivity {
     Log.d(TAG, "🔎 Methods of " + label + " (" + o.getClass().getName() + "):");
     for (Method m : o.getClass().getMethods()) {
       Log.d(TAG,
-          " • " + m.getReturnType().getSimpleName() + " " + m.getName() + "()  params:" + m.getParameterTypes().length);
+          " • " + m.getReturnType().getSimpleName() + " " + m.getName() + "() params:" + m.getParameterTypes().length);
     }
+  }
+
+  // --------- Link settings cepat (optional) ---------
+  private void tuneForSpeed() {
+    Object[] H = new Object[] { uhfFunc, uhfMgr, gClient };
+    for (Object h : H)
+      if (h != null) {
+        // EPC only
+        tryCall(h, "setReadTid", false);
+        tryCall(h, "setReadUser", false);
+        tryCall(h, "setBankEnable", 1); // 1 = EPC (pola vendor)
+        tryCall(h, "setInventoryMode", 0); // EPC-only
+        // Continuous fast
+        tryCall(h, "setWorkMode", 1);
+        tryCall(h, "setWorkingMode", 1);
+        tryCall(h, "setInventoryContinue", 1);
+        tryCall(h, "setContinuousMode", true);
+        tryCall(h, "setSpeed", 0); // 0 = fast
+        tryCall(h, "setBeeper", false); // matikan beep SDK (kita yang handle)
+        // Anti-collision
+        tryCall(h, "setSession", 0);
+        tryCall(h, "setTarget", 0);
+        tryCall(h, "setQ", 4);
+        tryCall(h, "setDynamicQ", true);
+        // Link profile (jika ada)
+        tryCall(h, "setProfile", 2);
+        tryCall(h, "setDR", 640);
+        tryCall(h, "setM", 2);
+      }
+    Log.d(TAG, "tuneForSpeed applied");
   }
 
   @Override
