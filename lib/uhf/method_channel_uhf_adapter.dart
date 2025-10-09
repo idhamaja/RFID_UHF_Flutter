@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'package:flutter/services.dart';
-import 'uhf_adapter.dart';
+import 'package:rfid_03/uhf/uhf_adapter.dart';
 
 class MethodChannelUhfAdapter implements UhfAdapter {
   static const _method = MethodChannel('uhf');
@@ -9,11 +9,12 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   final _ctrl = StreamController<TagHitNative>.broadcast();
   StreamSubscription? _eventSub;
   Timer? _pullTimer;
+  int _lastEventMs = 0;
 
   MethodChannelUhfAdapter() {
-    // EventChannel (batch atau single)
     _eventSub = _event.receiveBroadcastStream().listen(
       (e) {
+        final now = DateTime.now().millisecondsSinceEpoch;
         if (e is List) {
           for (final it in e) {
             final hit = TagHitNative.fromAny(it);
@@ -23,9 +24,10 @@ class MethodChannelUhfAdapter implements UhfAdapter {
           final hit = TagHitNative.fromAny(e);
           if (hit.epc.isNotEmpty) _ctrl.add(hit);
         }
+        _lastEventMs = now;
       },
       onError: (_) {
-        /* biarkan polling yang backup */
+        /* polling backup jalan terus */
       },
     );
   }
@@ -35,9 +37,13 @@ class MethodChannelUhfAdapter implements UhfAdapter {
 
   @override
   Future<void> startInventory() async {
-    // Polling backup SELALU aktif tiap 60 ms
+    // polling backup: agresif tapi ringan (selalu jalan; paket kecil)
     _pullTimer?.cancel();
-    _pullTimer = Timer.periodic(const Duration(milliseconds: 60), (_) async {
+    _pullTimer = Timer.periodic(const Duration(milliseconds: 45), (_) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      // kalau event lagi lancar, biarin tapi tetap sesekali tarik supaya
+      // buffer SDK tak menumpuk (≤ 120ms).
+      if (now - _lastEventMs < 120) return;
       try {
         final res = await _method.invokeMethod('pullBatch');
         if (res is List) {
