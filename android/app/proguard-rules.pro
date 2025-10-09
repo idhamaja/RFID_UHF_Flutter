@@ -1,0 +1,2 @@
+-keep class com.uhf.** { *; }
+-keep class com.idata.** { *; }
