@@ -6,9 +6,6 @@ class InfoCard extends StatelessWidget {
     required this.uniqueCount,
     required this.totalHits,
     required this.elapsedMs,
-
-    bool beepEnabled = true,
-    bool vibrateEnabled = true,
   });
 
   final int uniqueCount;
@@ -17,45 +14,62 @@ class InfoCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      elevation: 2,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            _InfoItem('Tag Population', '$uniqueCount'),
-            _InfoItem('Recognition\nfrequency', '$totalHits'),
-            _InfoItem('Inventory\ntime(ms)', '$elapsedMs'),
-          ],
+    // ms -> s (pembulatan ke bawah)
+    final int seconds = (elapsedMs / 1000).floor();
+    final String timeLabel = '$seconds s';
+
+    Widget tile(String title, String value) => Expanded(
+      child: Container(
+        height: 80,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: const [BoxShadow(blurRadius: 4, color: Color(0x11000000))],
+        ),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.center,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.black.withOpacity(.6),
+                  fontSize: 12,
+                  height: 1.1,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                value,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  height: 1.0,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
-  }
-}
 
-class _InfoItem extends StatelessWidget {
-  const _InfoItem(this.label, this.value);
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.center,
+    return Row(
       children: [
-        Text(
-          label,
-          textAlign: TextAlign.center,
-          style: textTheme.bodySmall?.copyWith(color: Colors.black54),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          value,
-          style: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
-        ),
+        tile('Tag Population', '$uniqueCount'),
+        const SizedBox(width: 7),
+        tile('Recognition\nfrequency', '$totalHits'),
+        const SizedBox(width: 7),
+        tile('Inventory time (s)', timeLabel), // <— label jadi (s)
       ],
     );
   }

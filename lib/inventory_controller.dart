@@ -68,10 +68,8 @@ class InventoryController extends ChangeNotifier {
     agg.rssi = hit.rssi;
     agg.last = now;
 
-    _flushTimer ??= Timer(
-      const Duration(milliseconds: 10),
-      _applyPending,
-    ); // ~100 fps UI
+    // flush ~30fps agar UI tidak rebuild terlalu sering
+    _flushTimer ??= Timer(const Duration(milliseconds: 32), _applyPending);
   }
 
   void _applyPending() {
@@ -99,10 +97,10 @@ class InventoryController extends ChangeNotifier {
     if (_isRunning) return;
     _isRunning = true;
     _startAt ??= DateTime.now();
-    notifyListeners(); // UI langsung berubah
+    notifyListeners();
 
     try {
-      await adapter.setPower(30); // max kalau modul sanggup
+      await adapter.setPower(30);
       await adapter.startInventory();
     } catch (_) {
       _isRunning = false;

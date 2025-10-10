@@ -32,7 +32,6 @@ class TagHitNative {
       return TagHitNative(epc, rssi);
     }
 
-    // fallback
     return TagHitNative(e.toString(), -70);
   }
 

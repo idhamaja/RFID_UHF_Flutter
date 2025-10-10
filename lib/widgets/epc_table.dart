@@ -5,9 +5,9 @@ class EpcTable extends StatelessWidget {
   const EpcTable({
     super.key,
     required this.rows,
-    this.maxVisible = 1500, // batasi render agar UI tetap ringan
+    this.maxVisible = 500, // batasi render agar UI tetap ringan
     this.rowHeight = 44.0,
-    this.controller, // opsional: jaga posisi scroll
+    this.controller,
   });
 
   final List<TagRow> rows;
@@ -17,7 +17,6 @@ class EpcTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // batasi jumlah baris yg dirender; sisanya tetap ada di controller
     final data = rows.length > maxVisible ? rows.sublist(0, maxVisible) : rows;
 
     return Card(
@@ -26,7 +25,6 @@ class EpcTable extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       child: Column(
         children: [
-          // Header
           Container(
             height: 44,
             padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -40,25 +38,20 @@ class EpcTable extends StatelessWidget {
               ],
             ),
           ),
-
-          // Body — auto handle kasus nested scroll
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final unbounded = constraints.maxHeight == double.infinity;
-
-                if (data.isEmpty) {
+                if (data.isEmpty)
                   return const Center(child: Text('Belum ada tag terbaca'));
-                }
 
                 return ListView.builder(
-                  // jika di dalam scroll lain (unbounded), aktifkan shrinkWrap
                   primary: !unbounded,
                   shrinkWrap: unbounded,
                   physics: const AlwaysScrollableScrollPhysics(),
                   controller: controller,
-                  itemExtent: rowHeight, // sangat mempercepat list besar
-                  cacheExtent: rowHeight * 30, // pre-render 30 baris di depan
+                  itemExtent: rowHeight,
+                  cacheExtent: rowHeight * 30,
                   addAutomaticKeepAlives: false,
                   addRepaintBoundaries: true,
                   padding: EdgeInsets.zero,
@@ -134,7 +127,7 @@ class _DataCell extends StatelessWidget {
     flex: flex,
     child: Text(
       text,
-      overflow: TextOverflow.ellipsis, // tak pecah layout ketika sangat panjang
+      overflow: TextOverflow.ellipsis,
       textAlign: align,
       style: TextStyle(fontSize: 12, fontFamily: mono ? 'RobotoMono' : null),
     ),

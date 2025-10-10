@@ -39,7 +39,8 @@ class _InventoryPageState extends State<InventoryPage> {
   @override
   void initState() {
     super.initState();
-    ctrl = InventoryController(MethodChannelUhfAdapter());
+    // PENTING: aktifkan event streaming supaya responsif
+    ctrl = InventoryController(MethodChannelUhfAdapter(useEvents: true));
   }
 
   @override
@@ -71,8 +72,6 @@ class _InventoryPageState extends State<InventoryPage> {
                 const SizedBox(height: 8),
                 Expanded(child: EpcTable(rows: ctrl.rows)),
                 const SizedBox(height: 8),
-
-                //
                 Row(
                   children: [
                     Expanded(
@@ -99,10 +98,7 @@ class _InventoryPageState extends State<InventoryPage> {
                 ),
                 ActionButtons(
                   isRunning: ctrl.isRunning,
-                  onStart: () {
-                    print("▶️ Start button clicked");
-                    ctrl.start();
-                  },
+                  onStart: ctrl.start,
                   onStop: ctrl.stop,
                   onClear: ctrl.clear,
                 ),
