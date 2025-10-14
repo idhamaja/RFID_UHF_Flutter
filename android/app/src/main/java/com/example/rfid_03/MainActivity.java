@@ -34,32 +34,28 @@ public class MainActivity extends FlutterActivity {
   private static final String EVENT_CH = "uhf/tags";
   private static final String TAG = "UHF";
 
-  // pacing & limits
-  private static final int CACHE_LIMIT = 10000;
-  private static final int PUSH_CHUNK = 96;
-  private static final int PUSH_GAP_MS = 16; // ~60fps ke Flutter
-  private static final int READER_IDLE_MS = 0; // loop reader tanpa jeda
+  // ===== pacing & limits (UI aman, cepat tapi hemat) =====
+  private static final int CACHE_LIMIT = 12000;
+  private static final int PUSH_CHUNK = 128;
+  private static final int PUSH_GAP_MS = 12; // ~80 fps ke Flutter (event batching)
+  private static final int READER_IDLE_MS = 0; // loop reader nonstop (dengan backoff dinamis)
   private static final int BEEP_GAP_MS = 200;
   private static final int VIB_GAP_MS = 240;
-  private static final int DUP_SUPPRESS_MS = 12;
+  private static final int DUP_SUPPRESS_MS = 8; // dedup lebih rapat → kurangi beban
   private static final int[] SERIAL_BAUD = new int[] { 921600, 460800, 230400, 115200 };
 
-  // fast-start
-  private static final int FASTSTART_MS = 1200;
-  private volatile boolean fastStart = false;
-  private long fastStartEndsAt = 0L;
+  // ===== Fast-Start (sapuan cepat awal) =====
+  private static final int FASTSTART_MS = 5000; // 5 detik agresif → tag cepat muncul
 
-  // default: matikan beep/vibrate demi performa murni (bisa di-toggle dari
-  // Flutter)
-  private boolean isBeepEnabled = false;
+  private boolean isBeepEnabled = false; // default off (bisa di‐toggle dari Flutter)
   private boolean isVibrateEnabled = false;
 
   private final Handler main = new Handler(Looper.getMainLooper());
-  private HandlerThread pushThread; // batch push -> off main
+  private HandlerThread pushThread;
   private Handler push;
-  private HandlerThread rpcThread; // handler untuk method RPC berat (pullBatch)
+  private HandlerThread rpcThread;
   private Handler rpc;
-  private volatile boolean pullBusy = false; // guard agar pullBatch tidak overlap
+  private volatile boolean pullBusy = false;
 
   private EventChannel.EventSink sink;
 
@@ -71,10 +67,10 @@ public class MainActivity extends FlutterActivity {
   private long lastPushAt = 0L;
   private boolean pushPosted = false;
 
-  // dedup cepat (LRU)
+  // dedup window (LRU kecil)
   private final LinkedHashMap<String, Long> recentEpc = new LinkedHashMap<String, Long>(512, 0.75f, true) {
     @Override
-    protected boolean removeEldestEntry(Map.Entry<String, Long> e) {
+    protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
       return size() > 2048;
     }
   };
@@ -90,17 +86,19 @@ public class MainActivity extends FlutterActivity {
   private long lastBeepAt = 0L;
   private long lastVibrateAt = 0L;
 
-  // adaptive Q
+  // kontrol adaptasi
   private long lastExpensivePollAt = 0L;
   private long lastQAdjustAt = 0L;
-  private int hitsSinceLastAdjust = 0;
+  private int hitsSinceLastAdjust = 0; // rate counter
   private int currentQ = 3;
 
-  // target nudge
+  // fast-start & target nudge
+  private volatile boolean fastStart = false;
+  private long fastStartEndsAt = 0L;
   private Thread targetThread;
   private volatile boolean targetLoop = false;
 
-  // micro-restart
+  // micro “nudge” untuk kasus stuck
   private long lastNudgeAt = 0L;
 
   @Override
@@ -121,15 +119,14 @@ public class MainActivity extends FlutterActivity {
                 result.success(null);
                 break;
               }
-              case "pullBatch": {
-                // jalankan di worker thread agar tidak blokir main/UI
-                if (pullBusy) { // coalesce
+              case "pullBatch": { // heavy I/O dipindah ke worker
+                if (pullBusy) {
                   result.success(drainTagCache());
                   break;
                 }
                 pullBusy = true;
                 rpc.post(() -> {
-                  List<Map<String, Object>> out = readBatchOnce(); // heavy I/O
+                  List<Map<String, Object>> out = readBatchOnce();
                   out.addAll(drainTagCache());
                   if (!out.isEmpty()) {
                     safeBeep();
@@ -184,13 +181,12 @@ public class MainActivity extends FlutterActivity {
           }
         });
 
-    // worker untuk push batching
+    // worker untuk push & rpc
     pushThread = new HandlerThread("uhf-push", Process.THREAD_PRIORITY_MORE_FAVORABLE);
     pushThread.start();
     push = new Handler(pushThread.getLooper());
 
-    // worker untuk RPC berat/polling
-    rpcThread = new HandlerThread("uhf-rpc", Process.THREAD_PRIORITY_MORE_FAVORABLE);
+    rpcThread = new HandlerThread("uhf-rpc", Process.THREAD_PRIORITY_DEFAULT);
     rpcThread.start();
     rpc = new Handler(rpcThread.getLooper());
   }
@@ -242,7 +238,7 @@ public class MainActivity extends FlutterActivity {
     tryRegisterCallbacks();
     tuneForSpeed();
 
-    // Fast-start: Q kecil & dynamicQ off supaya cepat "nyapu awal"
+    // FAST START: dynamicQ OFF + Q kecil supaya cepat menyapu populasi
     tryCall(uhfFunc, "setDynamicQ", false);
     tryCall(uhfMgr, "setDynamicQ", false);
     currentQ = 2;
@@ -261,13 +257,13 @@ public class MainActivity extends FlutterActivity {
     running = true;
     fastStart = true;
     fastStartEndsAt = SystemClock.uptimeMillis() + FASTSTART_MS;
-    lastQAdjustAt = fastStartEndsAt; // tunda adaptasi
+    lastQAdjustAt = fastStartEndsAt; // tunda adaptasi hingga fast-start selesai
 
     startReaderLoop();
     startFastStartPump();
-    startTargetNudge(fastStartEndsAt + 2000); // toggle target A/B hingga 2s sesudah fast-start
+    startTargetNudge(fastStartEndsAt + 2000); // 2s ekstra untuk menyapu target B
 
-    // prime agar UI langsung isi
+    // prime awal UI
     List<Map<String, Object>> prim = readBatchOnce();
     if (!prim.isEmpty()) {
       synchronized (tagCache) {
@@ -301,18 +297,28 @@ public class MainActivity extends FlutterActivity {
     if (readerThread != null)
       return;
     readerThread = new Thread(() -> {
+      // prioritas cukup tinggi untuk throughput, tapi tetap aman CPU
       Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
+      int idleStreak = 0;
       while (running) {
         try {
           int c = drainAllTagsOnce();
-          if (c == 0)
-            Thread.sleep(READER_IDLE_MS);
+          if (c == 0) {
+            // backoff kecil kalau kosong berturut-turut
+            idleStreak = Math.min(idleStreak + 1, 200);
+            int extra = (idleStreak < 5) ? 0 : (idleStreak < 30) ? 1 : (idleStreak < 80) ? 2 : 4;
+            int sleep = READER_IDLE_MS + extra;
+            if (sleep > 0)
+              Thread.sleep(sleep);
+          } else {
+            idleStreak = 0;
+          }
           maybeAdjustQ();
         } catch (InterruptedException e) {
           break;
         } catch (Throwable t) {
           try {
-            Thread.sleep(12);
+            Thread.sleep(8);
           } catch (InterruptedException ie) {
             break;
           }
@@ -336,9 +342,10 @@ public class MainActivity extends FlutterActivity {
         }
       }
       fastStart = false;
+      // hidupkan kembali dynamicQ sesudah prime
       tryCall(uhfFunc, "setDynamicQ", true);
       tryCall(uhfMgr, "setDynamicQ", true);
-      lastQAdjustAt = 0;
+      lastQAdjustAt = 0; // izinkan adaptasi segera
     }, "uhf-faststart").start();
   }
 
@@ -471,7 +478,7 @@ public class MainActivity extends FlutterActivity {
         } catch (Throwable ignore2) {
         }
       }
-      opened = ok || true;
+      opened = ok || true; // toleransi beberapa perangkat
     } catch (Throwable t) {
       Log.w(TAG, "GClient not available: " + t.getMessage());
       opened = true;
@@ -527,7 +534,7 @@ public class MainActivity extends FlutterActivity {
     return false;
   }
 
-  // ---------- tuning ----------
+  // ---------- tuning radio ----------
   private void tuneForSpeed() {
     Object[] H = new Object[] { uhfFunc, uhfMgr, gClient };
     for (Object h : H)
@@ -535,7 +542,7 @@ public class MainActivity extends FlutterActivity {
         tryCall(h, "setReadTid", false);
         tryCall(h, "setReadUser", false);
         tryCall(h, "setBankEnable", 1); // EPC only
-        tryCall(h, "setInventoryMode", 0); // EPC
+        tryCall(h, "setInventoryMode", 0);
         tryCall(h, "setMode", 0);
         tryCall(h, "setWorkingMode", 1); // continuous
         tryCall(h, "setWorkMode", 1);
@@ -546,27 +553,36 @@ public class MainActivity extends FlutterActivity {
         tryCall(h, "SetSession", 0);
         tryCall(h, "setTarget", 0);
         tryCall(h, "SetTarget", 0);
-        tryCall(h, "setQ", currentQ);
-        tryCall(h, "SetQValue", currentQ);
-        tryCall(h, "setProfile", 2); // link profile cepat
-        tryCall(h, "setLinkProfile", 2);
-        // beberapa modul punya profil lebih cepat (3)
-        tryCall(h, "setProfile", 3);
-        tryCall(h, "setLinkProfile", 3);
+
+        // link profile tercepat yang tersedia
+        if (tryCall(h, "setProfile", 3) == null)
+          tryCall(h, "setProfile", 2);
+        if (tryCall(h, "setLinkProfile", 3) == null)
+          tryCall(h, "setLinkProfile", 2);
+
         tryCall(h, "setDR", 640);
         tryCall(h, "setM", 2); // Miller-2
-        tryCall(h, "setTari", 25);
+        tryCall(h, "setTari", 25); // jika modul mendukung, 12/25/25us
         tryCall(h, "setBeeper", false);
+
+        // opsional filter RSSI (jika ada) – bantu kurangi collision tag yang sangat
+        // jauh
+        tryCall(h, "setRssiFilter", -75);
+        tryCall(h, "setMinRssi", -75);
       }
     Log.d(TAG, "tuneForSpeed applied");
   }
 
-  // adaptasi Q berbasis backlog (agresif)
+  // ---------- adaptasi Q: gabungan RATE + BACKLOG ----------
   private void maybeAdjustQ() {
     long now = SystemClock.uptimeMillis();
-    if (now - lastQAdjustAt < 250)
-      return;
+    if (now - lastQAdjustAt < 280)
+      return; // ~3–4 Hz
     lastQAdjustAt = now;
+
+    // laju temuan sejak push sebelumnya (proxy ‘rate’)
+    int rate = hitsSinceLastAdjust;
+    hitsSinceLastAdjust = 0;
 
     int backlog;
     synchronized (tagCache) {
@@ -574,14 +590,23 @@ public class MainActivity extends FlutterActivity {
     }
 
     int newQ = currentQ;
-    if (backlog > 1500)
+    // rate-first (lebih akurat untuk percepatan)
+    if (rate > 600)
       newQ = 6;
-    else if (backlog > 700)
-      newQ = 5;
-    else if (backlog > 250)
-      newQ = 4;
-    else if (backlog < 60)
+    else if (rate > 220)
+      newQ = Math.max(newQ, 5);
+    else if (rate > 90)
+      newQ = Math.max(newQ, 4);
+    else if (rate < 30 && backlog < 80)
       newQ = 3;
+
+    // guard by backlog jika antrean membengkak
+    if (backlog > 1800)
+      newQ = 6;
+    else if (backlog > 800)
+      newQ = Math.max(newQ, 5);
+    else if (backlog > 300)
+      newQ = Math.max(newQ, 4);
 
     if (newQ != currentQ) {
       tryCall(uhfFunc, "setQ", newQ);
@@ -589,7 +614,7 @@ public class MainActivity extends FlutterActivity {
       tryCall(uhfFunc, "SetQValue", newQ);
       tryCall(uhfMgr, "SetQValue", newQ);
       currentQ = newQ;
-      Log.d(TAG, "Adaptive Q(backlog=" + backlog + ") -> " + newQ);
+      Log.d(TAG, "Adaptive Q(rate=" + rate + ", backlog=" + backlog + ") -> " + newQ);
     }
   }
 
@@ -630,7 +655,7 @@ public class MainActivity extends FlutterActivity {
           Log.w(TAG, "push error", t);
         }
 
-        // micro-restart ringan saat backlog besar tapi batch kecil (stuck)
+        // micro-nudge bila batch kecil tapi backlog besar
         int backlogAfter;
         synchronized (tagCache) {
           backlogAfter = tagCache.size();
@@ -729,7 +754,7 @@ public class MainActivity extends FlutterActivity {
       return out;
 
     long now = SystemClock.uptimeMillis();
-    if (now - lastExpensivePollAt < 120)
+    if (now - lastExpensivePollAt < 100)
       return out; // throttle operasi mahal
     lastExpensivePollAt = now;
 

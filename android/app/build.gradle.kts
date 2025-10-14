@@ -24,9 +24,16 @@ android {
     kotlinOptions { jvmTarget = JavaVersion.VERSION_11.toString() }
 
     buildTypes {
-        release {
-            signingConfig = signingConfigs.getByName("debug")
+           buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
+        getByName("debug") {
+            isMinifyEnabled = false
+            isShrinkResources = false
+        }
+    }
     }
 
     // Tambahkan hanya jika nanti ada konflik resource .so (boleh dibiarkan)

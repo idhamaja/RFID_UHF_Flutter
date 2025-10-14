@@ -7,18 +7,22 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   static const _event = EventChannel('uhf/tags');
 
   final _ctrl = StreamController<TagHitNative>.broadcast();
+  final bool _useEvents;
+
   StreamSubscription? _eventSub;
 
   Timer? _pullTimer;
   int _startedAtMs = 0;
   bool _rpcBusy = false;
 
-  // simpan interval karena Timer tidak expose "period"
-  Duration _lastPeriod = const Duration(milliseconds: 30);
+  // Timer tidak expose periode, simpan sendiri
+  Duration _period = const Duration(milliseconds: 20); // super cepat di awal
+  int _lastEventMs = 0;
 
-  MethodChannelUhfAdapter({bool useEvents = false}) {
-    if (useEvents) {
+  MethodChannelUhfAdapter({bool useEvents = true}) : _useEvents = useEvents {
+    if (_useEvents) {
       _eventSub = _event.receiveBroadcastStream().listen((e) {
+        final now = DateTime.now().millisecondsSinceEpoch;
         if (e is List) {
           for (final it in e) {
             final hit = TagHitNative.fromAny(it);
@@ -28,6 +32,7 @@ class MethodChannelUhfAdapter implements UhfAdapter {
           final hit = TagHitNative.fromAny(e);
           if (hit.epc.isNotEmpty) _ctrl.add(hit);
         }
+        _lastEventMs = now;
       }, onError: (_) {});
     }
   }
@@ -37,22 +42,19 @@ class MethodChannelUhfAdapter implements UhfAdapter {
 
   Duration _wantedPeriod() {
     final now = DateTime.now().millisecondsSinceEpoch;
-    return (now - _startedAtMs) < 1200
-        ? const Duration(milliseconds: 30) // fase cepat
-        : const Duration(milliseconds: 90); // sustain
+    final age = now - _startedAtMs;
+    if (age < 1200)
+      return const Duration(milliseconds: 20); // 1.2s pertama agresif
+    if (age < 4000) return const Duration(milliseconds: 60); // stabilisasi
+    return const Duration(milliseconds: 120); // hemat
   }
 
-  void _startOrRescheduleTimer() {
+  void _reschedIfNeeded() {
     final want = _wantedPeriod();
-    if (_pullTimer == null) {
-      _lastPeriod = want;
-      _pullTimer = Timer.periodic(_lastPeriod, (_) async => _pullOnce());
-      return;
-    }
-    if (want != _lastPeriod) {
-      _pullTimer!.cancel();
-      _lastPeriod = want;
-      _pullTimer = Timer.periodic(_lastPeriod, (_) async => _pullOnce());
+    if (_pullTimer == null || want != _period) {
+      _pullTimer?.cancel();
+      _period = want;
+      _pullTimer = Timer.periodic(_period, (_) async => _pullOnce());
     }
   }
 
@@ -61,26 +63,28 @@ class MethodChannelUhfAdapter implements UhfAdapter {
     _pullTimer?.cancel();
     _startedAtMs = DateTime.now().millisecondsSinceEpoch;
 
-    // mulai polling backup (event channel sudah aktif jika dipilih)
-    _startOrRescheduleTimer();
-
-    // start di native
-    await _method.invokeMethod('startInventory');
-
-    // cek periodik untuk berpindah interval setelah 1.2s
-    Timer.periodic(const Duration(milliseconds: 100), (tick) {
+    // Start polling backup (EventChannel tetap jadi jalur utama)
+    _reschedIfNeeded();
+    // Re-evaluate interval beberapa kali di awal supaya selalu optimal
+    Timer.periodic(const Duration(milliseconds: 200), (t) {
       if (_pullTimer == null) {
-        tick.cancel();
+        t.cancel();
         return;
       }
-      _startOrRescheduleTimer();
-      if (_wantedPeriod() == const Duration(milliseconds: 90)) {
-        tick.cancel();
-      }
+      _reschedIfNeeded();
+      if (DateTime.now().millisecondsSinceEpoch - _startedAtMs > 4500)
+        t.cancel();
     });
+
+    await _method.invokeMethod('startInventory');
   }
 
   Future<void> _pullOnce() async {
+    // Jika event deras (<180ms), skip polling agar tidak membebani IPC
+    if (_useEvents) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastEventMs < 180) return;
+    }
     if (_rpcBusy) return;
     _rpcBusy = true;
     try {
@@ -95,7 +99,7 @@ class MethodChannelUhfAdapter implements UhfAdapter {
         if (hit.epc.isNotEmpty) _ctrl.add(hit);
       }
     } catch (_) {
-      // biarkan – native tetap jalan
+      // biarkan, native tetap jalan
     } finally {
       _rpcBusy = false;
     }
