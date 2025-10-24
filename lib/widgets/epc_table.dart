@@ -5,7 +5,7 @@ class EpcTable extends StatelessWidget {
   const EpcTable({
     super.key,
     required this.rows,
-    this.maxVisible = 500, // batasi render agar UI tetap ringan
+    this.maxVisible = 500,
     this.rowHeight = 44.0,
     this.controller,
   });
@@ -34,7 +34,7 @@ class EpcTable extends StatelessWidget {
                 _HeaderCell('SN', flex: 1),
                 _HeaderCell('EPC Data', flex: 6),
                 _HeaderCell('Num', flex: 2, align: TextAlign.center),
-                _HeaderCell('RSSI', flex: 2, align: TextAlign.center),
+                _HeaderCell('RSSI (dBm)', flex: 2, align: TextAlign.center),
               ],
             ),
           ),
@@ -42,12 +42,12 @@ class EpcTable extends StatelessWidget {
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final unbounded = constraints.maxHeight == double.infinity;
-                if (data.isEmpty)
+                if (data.isEmpty) {
                   return const Center(child: Text('Belum ada tag terbaca'));
-
+                }
                 return ListView.builder(
-                  primary: !unbounded,
-                  shrinkWrap: unbounded,
+                  primary: false, // <- penting: selalu false
+                  shrinkWrap: unbounded, // true hanya jika unbounded
                   physics: const AlwaysScrollableScrollPhysics(),
                   controller: controller,
                   itemExtent: rowHeight,
@@ -59,6 +59,7 @@ class EpcTable extends StatelessWidget {
                   itemBuilder: (context, index) {
                     final row = data[index];
                     final alt = (index & 1) == 1;
+                    final int rssiDisplay = row.lastRssi.clamp(-60, -30);
                     return Container(
                       key: ValueKey(row.epc),
                       color: alt ? Colors.grey.shade50 : Colors.white,
@@ -75,7 +76,7 @@ class EpcTable extends StatelessWidget {
                             align: TextAlign.center,
                           ),
                           _DataCell(
-                            '${row.lastRssi}',
+                            '$rssiDisplay',
                             flex: 2,
                             align: TextAlign.center,
                           ),

@@ -28,26 +28,36 @@ import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodChannel;
 
+/**
+ * Versi "first hit < 2 detik":
+ * - Start radio dulu, dorong first EPC instan, tuning sambil jalan
+ * - RSSI gate awal longgar, auto-stop & reset ringan bila macet
+ */
 public class MainActivity extends FlutterActivity {
 
   private static final String METHOD_CH = "uhf";
   private static final String EVENT_CH = "uhf/tags";
   private static final String TAG = "UHF";
 
-  // ===== pacing & limits (UI aman, cepat tapi hemat) =====
+  // pacing & limits
   private static final int CACHE_LIMIT = 12000;
   private static final int PUSH_CHUNK = 128;
-  private static final int PUSH_GAP_MS = 12; // ~80 fps ke Flutter (event batching)
-  private static final int READER_IDLE_MS = 0; // loop reader nonstop (dengan backoff dinamis)
+  private static final int PUSH_GAP_MS = 8;
+  private static final int READER_IDLE_MS = 0;
   private static final int BEEP_GAP_MS = 200;
   private static final int VIB_GAP_MS = 240;
-  private static final int DUP_SUPPRESS_MS = 8; // dedup lebih rapat → kurangi beban
+  private static final int DUP_SUPPRESS_MS = 6;
   private static final int[] SERIAL_BAUD = new int[] { 921600, 460800, 230400, 115200 };
 
-  // ===== Fast-Start (sapuan cepat awal) =====
-  private static final int FASTSTART_MS = 5000; // 5 detik agresif → tag cepat muncul
+  // fast start
+  private static final int FASTSTART_MS = 2500;
+  private static final int FIRST_HIT_DEADLINE_MS = 1500;
 
-  private boolean isBeepEnabled = false; // default off (bisa di‐toggle dari Flutter)
+  // RSSI (dBm)
+  private static final int RSSI_FAST_DBM = -86;
+  private static final int RSSI_STEADY_DBM = -60;
+
+  private boolean isBeepEnabled = false;
   private boolean isVibrateEnabled = false;
 
   private final Handler main = new Handler(Looper.getMainLooper());
@@ -67,10 +77,9 @@ public class MainActivity extends FlutterActivity {
   private long lastPushAt = 0L;
   private boolean pushPosted = false;
 
-  // dedup window (LRU kecil)
   private final LinkedHashMap<String, Long> recentEpc = new LinkedHashMap<String, Long>(512, 0.75f, true) {
     @Override
-    protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+    protected boolean removeEldestEntry(Map.Entry<String, Long> e) {
       return size() > 2048;
     }
   };
@@ -86,20 +95,24 @@ public class MainActivity extends FlutterActivity {
   private long lastBeepAt = 0L;
   private long lastVibrateAt = 0L;
 
-  // kontrol adaptasi
   private long lastExpensivePollAt = 0L;
   private long lastQAdjustAt = 0L;
-  private int hitsSinceLastAdjust = 0; // rate counter
+  private int hitsSinceLastAdjust = 0;
   private int currentQ = 3;
 
-  // fast-start & target nudge
   private volatile boolean fastStart = false;
   private long fastStartEndsAt = 0L;
   private Thread targetThread;
   private volatile boolean targetLoop = false;
 
-  // micro “nudge” untuk kasus stuck
   private long lastNudgeAt = 0L;
+
+  private volatile boolean seenAny = false;
+  private long firstSeenAt = 0L;
+  private Thread bootstrapThread;
+  private volatile int currentGateDbm = RSSI_FAST_DBM;
+
+  private volatile boolean firstPushDone = false;
 
   @Override
   public void configureFlutterEngine(@NonNull FlutterEngine engine) {
@@ -109,17 +122,15 @@ public class MainActivity extends FlutterActivity {
         .setMethodCallHandler((call, result) -> {
           try {
             switch (call.method) {
-              case "startInventory": {
+              case "startInventory":
                 startInventory();
                 result.success(null);
                 break;
-              }
-              case "stopInventory": {
+              case "stopInventory":
                 stopInventory();
                 result.success(null);
                 break;
-              }
-              case "pullBatch": { // heavy I/O dipindah ke worker
+              case "pullBatch":
                 if (pullBusy) {
                   result.success(drainTagCache());
                   break;
@@ -141,7 +152,6 @@ public class MainActivity extends FlutterActivity {
                   });
                 });
                 break;
-              }
               case "setPower": {
                 Integer p = call.argument("power");
                 setPower(p == null ? 30 : Math.max(5, Math.min(30, p)));
@@ -181,7 +191,6 @@ public class MainActivity extends FlutterActivity {
           }
         });
 
-    // worker untuk push & rpc
     pushThread = new HandlerThread("uhf-push", Process.THREAD_PRIORITY_MORE_FAVORABLE);
     pushThread.start();
     push = new Handler(pushThread.getLooper());
@@ -191,7 +200,6 @@ public class MainActivity extends FlutterActivity {
     rpc = new Handler(rpcThread.getLooper());
   }
 
-  // ---------- beep & vibrate ----------
   private void safeBeep() {
     if (!isBeepEnabled)
       return;
@@ -226,44 +234,120 @@ public class MainActivity extends FlutterActivity {
     }
   }
 
-  // ---------- control ----------
+  private void kickWarmBurst() {
+    rpc.post(() -> {
+      try {
+        tryCall(uhfFunc, "setInventoryContinue", 1);
+        tryCall(uhfMgr, "setInventoryContinue", 1);
+        for (int i = 0; i < 3; i++) {
+          tryCall(uhfFunc, "setTarget", (i & 1));
+          tryCall(uhfMgr, "setTarget", (i & 1));
+          if (i == 1 && tryCall(uhfFunc, "inventoryReset") == null) {
+            invokeAny(uhfFunc, "inventoryStop");
+            Thread.sleep(60);
+            invokeAny(uhfFunc, "inventoryStart");
+          }
+          Thread.sleep(80);
+        }
+      } catch (Throwable ignore) {
+      }
+    });
+  }
+
+  private void startRescueDeadline(long deadlineMs) {
+    new Thread(() -> {
+      long end = SystemClock.uptimeMillis() + deadlineMs;
+      while (running && SystemClock.uptimeMillis() < end && !seenAny) {
+        try {
+          Thread.sleep(50);
+        } catch (Throwable ignore) {
+        }
+      }
+      if (!running || seenAny)
+        return;
+      try {
+        setMinRssiBoth(-75);
+        configureRegionForBootstrap();
+        if (tryCall(uhfFunc, "inventoryReset") == null) {
+          invokeAny(uhfFunc, "inventoryStop");
+          Thread.sleep(120);
+          invokeAny(uhfFunc, "inventoryStart");
+        }
+        startTargetNudge(SystemClock.uptimeMillis() + 1500);
+      } catch (Throwable ignore) {
+      }
+    }, "uhf-deadline").start();
+  }
+
+  private void setMinRssiBoth(int dbm) {
+    tryCall(uhfFunc, "setRssiFilter", dbm);
+    tryCall(uhfMgr, "setRssiFilter", dbm);
+    tryCall(uhfFunc, "setMinRssi", dbm);
+    tryCall(uhfMgr, "setMinRssi", dbm);
+    currentGateDbm = dbm;
+  }
+
+  private static int normalizeToDbm(int v) {
+    if (v > 0 && v <= 300)
+      return -90 + (v * 60) / 300;
+    return v;
+  }
+
   private void startInventory() throws Exception {
     ensureReady();
-    if (!methodsDumped) {
-      dumpAllMethods("uhfMgr", uhfMgr);
-      dumpAllMethods("uhfFunc", uhfFunc);
-      dumpAllMethods("gClient", gClient);
-      methodsDumped = true;
-    }
-    tryRegisterCallbacks();
-    tuneForSpeed();
 
-    // FAST START: dynamicQ OFF + Q kecil supaya cepat menyapu populasi
-    tryCall(uhfFunc, "setDynamicQ", false);
-    tryCall(uhfMgr, "setDynamicQ", false);
-    currentQ = 2;
-    tryCall(uhfFunc, "setQ", currentQ);
-    tryCall(uhfMgr, "setQ", currentQ);
-    tryCall(uhfFunc, "SetQValue", currentQ);
-    tryCall(uhfMgr, "SetQValue", currentQ);
-
-    if (!invokeAny(uhfFunc, "startInventoryTag") && !invokeAny(uhfFunc, "inventoryStart")
-        && !invokeAny(uhfFunc, "startRead")
-        && !invokeAny(uhfMgr, "startInventoryTag") && !invokeAny(uhfMgr, "inventoryStart")
-        && !invokeAny(uhfMgr, "startRead")) {
-      Log.w(TAG, "No startInventory method found");
-    }
+    boolean started = invokeAny(uhfFunc, "startInventoryTag") ||
+        invokeAny(uhfFunc, "inventoryStart") ||
+        invokeAny(uhfFunc, "startRead") ||
+        invokeAny(uhfMgr, "startInventoryTag") ||
+        invokeAny(uhfMgr, "inventoryStart") ||
+        invokeAny(uhfMgr, "startRead");
 
     running = true;
     fastStart = true;
-    fastStartEndsAt = SystemClock.uptimeMillis() + FASTSTART_MS;
-    lastQAdjustAt = fastStartEndsAt; // tunda adaptasi hingga fast-start selesai
+    long now = SystemClock.uptimeMillis();
+    fastStartEndsAt = now + FASTSTART_MS;
+    lastQAdjustAt = fastStartEndsAt;
+    seenAny = false;
+    firstSeenAt = 0L;
+    firstPushDone = false;
 
     startReaderLoop();
-    startFastStartPump();
-    startTargetNudge(fastStartEndsAt + 2000); // 2s ekstra untuk menyapu target B
+    kickWarmBurst();
+    startRescueDeadline(FIRST_HIT_DEADLINE_MS);
 
-    // prime awal UI
+    setMinRssiBoth(RSSI_FAST_DBM);
+    tryCall(uhfFunc, "setContinuousMode", true);
+    tryCall(uhfMgr, "setContinuousMode", true);
+    tryCall(uhfFunc, "setInventoryContinue", 1);
+    tryCall(uhfMgr, "setInventoryContinue", 1);
+
+    rpc.post(() -> {
+      try {
+        tryRegisterCallbacks();
+        if (!methodsDumped) {
+          methodsDumped = true;
+        }
+        tryCall(uhfFunc, "setDynamicQ", false);
+        tryCall(uhfMgr, "setDynamicQ", false);
+        currentQ = 0;
+        tryCall(uhfFunc, "setQ", currentQ);
+        tryCall(uhfMgr, "setQ", currentQ);
+        tryCall(uhfFunc, "SetQValue", currentQ);
+        tryCall(uhfMgr, "SetQValue", currentQ);
+
+        configureRegionForBootstrap();
+
+        Thread.sleep(1500);
+        tryCall(uhfFunc, "setDynamicQ", true);
+        tryCall(uhfMgr, "setDynamicQ", true);
+        setMinRssiBoth(RSSI_STEADY_DBM);
+        restoreRegionAfterBootstrap();
+        lastQAdjustAt = 0;
+      } catch (Throwable ignore) {
+      }
+    });
+
     List<Map<String, Object>> prim = readBatchOnce();
     if (!prim.isEmpty()) {
       synchronized (tagCache) {
@@ -273,11 +357,35 @@ public class MainActivity extends FlutterActivity {
     }
   }
 
+  private void configureRegionForBootstrap() {
+    tryCall(uhfFunc, "setHopping", false);
+    tryCall(uhfMgr, "setHopping", false);
+
+    tryCall(uhfFunc, "setRegion", 1);
+    tryCall(uhfMgr, "setRegion", 1);
+    tryCall(uhfFunc, "setFreRegion", 1);
+    tryCall(uhfMgr, "setFreRegion", 1);
+
+    tryCall(uhfFunc, "setChannel", 6);
+    tryCall(uhfMgr, "setChannel", 6);
+    tryCall(uhfFunc, "setFrequency", 922625);
+    tryCall(uhfMgr, "setFrequency", 922625);
+    tryCall(uhfFunc, "setUserDefineFrequency", 922000, 923000, 250);
+    tryCall(uhfMgr, "setFrequencyRegion", 920000, 925000, 500);
+
+    tryCall(uhfFunc, "setProfile", 3);
+    tryCall(uhfMgr, "setProfile", 3);
+  }
+
+  private void restoreRegionAfterBootstrap() {
+    tryCall(uhfFunc, "setHopping", true);
+    tryCall(uhfMgr, "setHopping", true);
+  }
+
   private void stopInventory() {
     running = false;
     fastStart = false;
     stopTargetNudge();
-
     if (readerThread != null) {
       readerThread.interrupt();
       readerThread = null;
@@ -297,22 +405,19 @@ public class MainActivity extends FlutterActivity {
     if (readerThread != null)
       return;
     readerThread = new Thread(() -> {
-      // prioritas cukup tinggi untuk throughput, tapi tetap aman CPU
       Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
       int idleStreak = 0;
       while (running) {
         try {
           int c = drainAllTagsOnce();
           if (c == 0) {
-            // backoff kecil kalau kosong berturut-turut
             idleStreak = Math.min(idleStreak + 1, 200);
             int extra = (idleStreak < 5) ? 0 : (idleStreak < 30) ? 1 : (idleStreak < 80) ? 2 : 4;
             int sleep = READER_IDLE_MS + extra;
             if (sleep > 0)
               Thread.sleep(sleep);
-          } else {
+          } else
             idleStreak = 0;
-          }
           maybeAdjustQ();
         } catch (InterruptedException e) {
           break;
@@ -328,27 +433,6 @@ public class MainActivity extends FlutterActivity {
     readerThread.start();
   }
 
-  private void startFastStartPump() {
-    new Thread(() -> {
-      Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE);
-      while (running && fastStart && SystemClock.uptimeMillis() < fastStartEndsAt) {
-        try {
-          int c = drainAllTagsOnce();
-          if (c == 0)
-            Thread.sleep(2);
-          schedulePush();
-        } catch (InterruptedException e) {
-          break;
-        }
-      }
-      fastStart = false;
-      // hidupkan kembali dynamicQ sesudah prime
-      tryCall(uhfFunc, "setDynamicQ", true);
-      tryCall(uhfMgr, "setDynamicQ", true);
-      lastQAdjustAt = 0; // izinkan adaptasi segera
-    }, "uhf-faststart").start();
-  }
-
   private void startTargetNudge(long untilMs) {
     if (targetThread != null)
       return;
@@ -357,10 +441,10 @@ public class MainActivity extends FlutterActivity {
       int t = 0;
       while (running && targetLoop && SystemClock.uptimeMillis() < untilMs) {
         try {
-          int tgt = (t++ & 1); // 0,1,0,1...
+          int tgt = (t++ & 1);
           tryCall(uhfFunc, "setTarget", tgt);
           tryCall(uhfMgr, "setTarget", tgt);
-          Thread.sleep(50); // 20x/detik
+          Thread.sleep(50);
         } catch (Throwable ignore) {
         }
       }
@@ -394,7 +478,6 @@ public class MainActivity extends FlutterActivity {
       openSerialIfAny();
   }
 
-  // ---------- INIT ----------
   private void initManagerFunction() throws Exception {
     Class<?> mgrClz = Class.forName("com.uhf.base.UHFManager");
     Method getter = null;
@@ -478,17 +561,16 @@ public class MainActivity extends FlutterActivity {
         } catch (Throwable ignore2) {
         }
       }
-      opened = ok || true; // toleransi beberapa perangkat
+      opened = ok || true;
     } catch (Throwable t) {
       Log.w(TAG, "GClient not available: " + t.getMessage());
       opened = true;
     }
   }
 
-  // ---------- callbacks ----------
   private void tryRegisterCallbacks() {
     try {
-      Class<?> logIface = Class.forName("com.idata.gg.reader.api.dal.HandlerTagEpcLog");
+      final Class<?> logIface = (Class<?>) Class.forName("com.idata.gg.reader.api.dal.HandlerTagEpcLog");
       Object logProxy = Proxy.newProxyInstance(
           logIface.getClassLoader(), new Class[] { logIface },
           (proxy, method, args) -> {
@@ -497,7 +579,7 @@ public class MainActivity extends FlutterActivity {
             return null;
           });
 
-      Class<?> overIface = Class.forName("com.idata.gg.reader.api.dal.HandlerTagEpcOver");
+      final Class<?> overIface = (Class<?>) Class.forName("com.idata.gg.reader.api.dal.HandlerTagEpcOver");
       Object overProxy = Proxy.newProxyInstance(
           overIface.getClassLoader(), new Class[] { overIface },
           (proxy, method, args) -> null);
@@ -518,79 +600,38 @@ public class MainActivity extends FlutterActivity {
     }
   }
 
-  private boolean registerListenerOnHost(Object host, String name, Class<?> iface, Object proxy) {
-    if (host == null)
+  private boolean registerListenerOnHost(Object host, String name, Class iface, Object proxy) {
+    if (host == null || iface == null)
       return false;
     try {
-      for (Method m : host.getClass().getMethods())
-        if (m.getName().equals(name) && m.getParameterTypes().length == 1
+      for (Method m : host.getClass().getMethods()) {
+        if (m.getName().equals(name)
+            && m.getParameterTypes().length == 1
             && m.getParameterTypes()[0].isAssignableFrom(iface)) {
           m.setAccessible(true);
           m.invoke(host, proxy);
           return true;
         }
+      }
     } catch (Throwable ignore) {
     }
     return false;
   }
 
-  // ---------- tuning radio ----------
-  private void tuneForSpeed() {
-    Object[] H = new Object[] { uhfFunc, uhfMgr, gClient };
-    for (Object h : H)
-      if (h != null) {
-        tryCall(h, "setReadTid", false);
-        tryCall(h, "setReadUser", false);
-        tryCall(h, "setBankEnable", 1); // EPC only
-        tryCall(h, "setInventoryMode", 0);
-        tryCall(h, "setMode", 0);
-        tryCall(h, "setWorkingMode", 1); // continuous
-        tryCall(h, "setWorkMode", 1);
-        tryCall(h, "setContinuousMode", true);
-        tryCall(h, "setInventoryContinue", 1);
-        tryCall(h, "setSpeed", 0); // fast
-        tryCall(h, "setSession", 0); // S0
-        tryCall(h, "SetSession", 0);
-        tryCall(h, "setTarget", 0);
-        tryCall(h, "SetTarget", 0);
-
-        // link profile tercepat yang tersedia
-        if (tryCall(h, "setProfile", 3) == null)
-          tryCall(h, "setProfile", 2);
-        if (tryCall(h, "setLinkProfile", 3) == null)
-          tryCall(h, "setLinkProfile", 2);
-
-        tryCall(h, "setDR", 640);
-        tryCall(h, "setM", 2); // Miller-2
-        tryCall(h, "setTari", 25); // jika modul mendukung, 12/25/25us
-        tryCall(h, "setBeeper", false);
-
-        // opsional filter RSSI (jika ada) – bantu kurangi collision tag yang sangat
-        // jauh
-        tryCall(h, "setRssiFilter", -75);
-        tryCall(h, "setMinRssi", -75);
-      }
-    Log.d(TAG, "tuneForSpeed applied");
-  }
-
-  // ---------- adaptasi Q: gabungan RATE + BACKLOG ----------
   private void maybeAdjustQ() {
     long now = SystemClock.uptimeMillis();
     if (now - lastQAdjustAt < 280)
-      return; // ~3–4 Hz
+      return;
     lastQAdjustAt = now;
 
-    // laju temuan sejak push sebelumnya (proxy ‘rate’)
     int rate = hitsSinceLastAdjust;
     hitsSinceLastAdjust = 0;
-
     int backlog;
     synchronized (tagCache) {
       backlog = tagCache.size();
     }
 
     int newQ = currentQ;
-    // rate-first (lebih akurat untuk percepatan)
     if (rate > 600)
       newQ = 6;
     else if (rate > 220)
@@ -600,7 +641,6 @@ public class MainActivity extends FlutterActivity {
     else if (rate < 30 && backlog < 80)
       newQ = 3;
 
-    // guard by backlog jika antrean membengkak
     if (backlog > 1800)
       newQ = 6;
     else if (backlog > 800)
@@ -614,11 +654,10 @@ public class MainActivity extends FlutterActivity {
       tryCall(uhfFunc, "SetQValue", newQ);
       tryCall(uhfMgr, "SetQValue", newQ);
       currentQ = newQ;
-      Log.d(TAG, "Adaptive Q(rate=" + rate + ", backlog=" + backlog + ") -> " + newQ);
+      Log.d(TAG, "Adaptive Q -> " + newQ);
     }
   }
 
-  // ---------- push batching ----------
   private void schedulePush() {
     if (sink == null || pushPosted)
       return;
@@ -655,14 +694,16 @@ public class MainActivity extends FlutterActivity {
           Log.w(TAG, "push error", t);
         }
 
-        // micro-nudge bila batch kecil tapi backlog besar
+        safeVibrate(14);
+        safeBeep();
+
         int backlogAfter;
         synchronized (tagCache) {
           backlogAfter = tagCache.size();
         }
-        long now = SystemClock.uptimeMillis();
-        if (batch.size() < 8 && backlogAfter > 800 && now - lastNudgeAt > 600) {
-          lastNudgeAt = now;
+        long now1 = SystemClock.uptimeMillis();
+        if (batch.size() < 8 && backlogAfter > 800 && now1 - lastNudgeAt > 600) {
+          lastNudgeAt = now1;
           rpc.post(() -> {
             try {
               if (tryCall(uhfFunc, "inventoryReset") == null) {
@@ -673,7 +714,6 @@ public class MainActivity extends FlutterActivity {
             }
           });
         }
-
         synchronized (tagCache) {
           if (!tagCache.isEmpty())
             schedulePush();
@@ -682,7 +722,6 @@ public class MainActivity extends FlutterActivity {
     }, delay);
   }
 
-  // ---------- drain ----------
   private int drainAllTagsOnce() {
     int c = 0;
     c += drainBySinglePop(uhfFunc);
@@ -696,9 +735,8 @@ public class MainActivity extends FlutterActivity {
     if (host == null)
       return 0;
     String[] names = new String[] {
-        "readTagFromBuffer", "getTagFromBuffer", "popTagFromBuffer",
-        "inventoryReadTagFromBuffer", "readBufferTag", "getOneTag",
-        "readUhfBufferTag", "readTagFromBufferByOnce", "getEpcFromBuffer"
+        "readTagFromBuffer", "getTagFromBuffer", "popTagFromBuffer", "inventoryReadTagFromBuffer",
+        "readBufferTag", "getOneTag", "readUhfBufferTag", "readTagFromBufferByOnce", "getEpcFromBuffer"
     };
     int c = 0;
     for (String n : names) {
@@ -715,8 +753,7 @@ public class MainActivity extends FlutterActivity {
     if (host == null)
       return 0;
     String[] names = new String[] {
-        "getTagList", "getTags", "readBuffer", "getInventoryTagList",
-        "getInventoryTag", "inventoryBuffer"
+        "getTagList", "getTags", "readBuffer", "getInventoryTagList", "getInventoryTag", "inventoryBuffer"
     };
     int c = 0;
     for (String n : names) {
@@ -739,15 +776,12 @@ public class MainActivity extends FlutterActivity {
     return c;
   }
 
-  // ---------- pullBatch helpers ----------
   private List<Map<String, Object>> readBatchOnce() {
     List<Map<String, Object>> out = new ArrayList<>();
-
     drainToListBySinglePop(uhfFunc, out);
     drainToListBySinglePop(uhfMgr, out);
     if (!out.isEmpty())
       return out;
-
     drainToListByList(uhfFunc, out);
     drainToListByList(uhfMgr, out);
     if (!out.isEmpty())
@@ -755,7 +789,7 @@ public class MainActivity extends FlutterActivity {
 
     long now = SystemClock.uptimeMillis();
     if (now - lastExpensivePollAt < 100)
-      return out; // throttle operasi mahal
+      return out;
     lastExpensivePollAt = now;
 
     drainToListByTextLog(uhfFunc, out);
@@ -784,9 +818,8 @@ public class MainActivity extends FlutterActivity {
     if (host == null)
       return;
     String[] names = new String[] {
-        "readTagFromBuffer", "getTagFromBuffer", "popTagFromBuffer",
-        "inventoryReadTagFromBuffer", "readBufferTag", "getOneTag",
-        "readUhfBufferTag", "readTagFromBufferByOnce", "getEpcFromBuffer"
+        "readTagFromBuffer", "getTagFromBuffer", "popTagFromBuffer", "inventoryReadTagFromBuffer",
+        "readBufferTag", "getOneTag", "readUhfBufferTag", "readTagFromBufferByOnce", "getEpcFromBuffer"
     };
     for (String n : names) {
       Object tag;
@@ -802,8 +835,7 @@ public class MainActivity extends FlutterActivity {
     if (host == null)
       return;
     String[] names = new String[] {
-        "getTagList", "getTags", "readBuffer", "getInventoryTagList",
-        "getInventoryTag", "inventoryBuffer"
+        "getTagList", "getTags", "readBuffer", "getInventoryTagList", "getInventoryTag", "inventoryBuffer"
     };
     for (String n : names) {
       Object list = tryCall(host, n);
@@ -849,7 +881,6 @@ public class MainActivity extends FlutterActivity {
       Object v = tryCall(host, n);
       if (v == null)
         continue;
-
       byte[] buf = null;
       if (v instanceof byte[])
         buf = (byte[]) v;
@@ -861,7 +892,6 @@ public class MainActivity extends FlutterActivity {
       }
       if (buf == null || buf.length == 0)
         continue;
-
       String text = new String(buf);
       Map<String, Object> m = mapFromInfo(text);
       if (m != null)
@@ -879,12 +909,10 @@ public class MainActivity extends FlutterActivity {
         String mn = m.getName().toLowerCase();
         if (!(mn.contains("tag") || mn.contains("epc") || mn.contains("buf") || mn.contains("log")))
           continue;
-
         m.setAccessible(true);
         Object v = m.invoke(host);
         if (v == null)
           continue;
-
         if (v instanceof String) {
           Map<String, Object> map = mapFromInfo(v);
           if (map != null)
@@ -916,11 +944,35 @@ public class MainActivity extends FlutterActivity {
     }
   }
 
-  // ---------- publish ----------
+  private void pushFirstNow(Map<String, Object> first) {
+    if (sink == null || first == null)
+      return;
+    List<Map<String, Object>> one = new ArrayList<>(1);
+    one.add(first);
+    main.post(() -> {
+      try {
+        sink.success(one);
+      } catch (Throwable ignore) {
+      }
+      safeBeep();
+      safeVibrate(14);
+    });
+  }
+
   private void publishTagFromInfo(Object info) {
     Map<String, Object> map = mapFromInfo(info);
     if (map == null)
       return;
+
+    if (!seenAny) {
+      seenAny = true;
+      firstSeenAt = SystemClock.uptimeMillis();
+    }
+
+    if (!firstPushDone) {
+      firstPushDone = true;
+      pushFirstNow(map);
+    }
 
     String epc = (String) map.get("epc");
     long now = SystemClock.uptimeMillis();
@@ -948,7 +1000,6 @@ public class MainActivity extends FlutterActivity {
     return snap;
   }
 
-  // ---------- map helpers ----------
   private static String parseHexFromText(String s) {
     if (s == null)
       return null;
@@ -985,15 +1036,22 @@ public class MainActivity extends FlutterActivity {
     if (epc == null || epc.isEmpty())
       return null;
 
-    Integer rssi = extractInt(info, new String[] { "getRssi", "getRssiDbm", "getRssidBm", "getReadRssi", "getDbm" });
-    if (rssi == null)
-      rssi = parseRssiFromText(String.valueOf(info));
-    if (rssi == null)
-      rssi = -70;
+    Integer rssiRaw = extractInt(info, new String[] { "getRssi", "getRssiDbm", "getRssidBm", "getReadRssi", "getDbm" });
+    if (rssiRaw == null)
+      rssiRaw = parseRssiFromText(String.valueOf(info));
+    boolean hasRssi = (rssiRaw != null);
+    if (rssiRaw == null)
+      rssiRaw = -70;
+    int rssiDbm = normalizeToDbm(rssiRaw);
+
+    int gate = currentGateDbm;
+    if (hasRssi && rssiDbm < gate)
+      return null;
 
     Map<String, Object> m = new HashMap<>();
     m.put("epc", epc);
-    m.put("rssi", rssi);
+    m.put("rssi", rssiRaw);
+    m.put("rssiDbm", rssiDbm);
     return m;
   }
 
@@ -1017,23 +1075,20 @@ public class MainActivity extends FlutterActivity {
     return null;
   }
 
-  // ---------- reflection ----------
   private Method findMethod(Object target, String name, int paramCount) {
     if (target == null)
       return null;
     Class<?> c = target.getClass();
-    for (Method m : c.getMethods()) {
+    for (Method m : c.getMethods())
       if (m.getName().equals(name) && m.getParameterTypes().length == paramCount) {
         m.setAccessible(true);
         return m;
       }
-    }
-    for (Method m : c.getDeclaredMethods()) {
+    for (Method m : c.getDeclaredMethods())
       if (m.getName().equals(name) && m.getParameterTypes().length == paramCount) {
         m.setAccessible(true);
         return m;
       }
-    }
     return null;
   }
 
@@ -1068,18 +1123,6 @@ public class MainActivity extends FlutterActivity {
     }
   }
 
-  private void dumpAllMethods(String label, Object o) {
-    if (o == null) {
-      Log.d(TAG, "🔎 " + label + " = null");
-      return;
-    }
-    Log.d(TAG, "🔎 Methods of " + label + " (" + o.getClass().getName() + "):");
-    for (Method m : o.getClass().getMethods()) {
-      Log.d(TAG, " • " + m.getReturnType().getSimpleName() + " " + m.getName()
-          + "() params:" + m.getParameterTypes().length);
-    }
-  }
-
   @Override
   protected void onDestroy() {
     try {
@@ -1090,7 +1133,6 @@ public class MainActivity extends FlutterActivity {
       invokeAny(uhfMgr, "setPowerState_UHF", false);
     } catch (Throwable ignore) {
     }
-
     try {
       if (pushThread != null) {
         pushThread.quitSafely();
@@ -1107,7 +1149,6 @@ public class MainActivity extends FlutterActivity {
       }
     } catch (Throwable ignore) {
     }
-
     try {
       if (toneGen != null) {
         toneGen.release();

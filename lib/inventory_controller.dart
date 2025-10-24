@@ -39,7 +39,10 @@ class InventoryController extends ChangeNotifier {
   bool _dirty = true;
 
   int _totalHits = 0;
+
   DateTime? _startAt;
+  DateTime? _firstHitAt;
+
   Timer? _flushTimer;
 
   List<TagRow> get rows {
@@ -53,13 +56,31 @@ class InventoryController extends ChangeNotifier {
 
   int get uniqueTagCount => _rows.length;
   int get totalHitCount => _totalHits;
+
   int get elapsedMilliseconds => _startAt == null
       ? 0
       : DateTime.now().difference(_startAt!).inMilliseconds;
 
+  int get elapsedSeconds => (elapsedMilliseconds / 1000).floor();
+
+  int get firstHitMilliseconds => (_startAt == null || _firstHitAt == null)
+      ? 0
+      : _firstHitAt!.difference(_startAt!).inMilliseconds;
+
+  /// First hit (dibulatkan ke atas agar tidak 0 s)
+  int get firstHitSeconds {
+    final ms = firstHitMilliseconds;
+    if (ms <= 0) return 0;
+    return (ms / 1000).ceil();
+    // Jika ingin lebih presisi: return (ms / 1000).clamp(0, double.infinity).ceil();
+  }
+
   void _onTagHit(TagHitNative hit) {
     if (!_isRunning || hit.epc.isEmpty) return;
     final now = DateTime.now();
+
+    _firstHitAt ??= now;
+
     final agg = _pending.putIfAbsent(
       hit.epc,
       () => _PendingAgg(cnt: 0, rssi: hit.rssi, last: now),
@@ -68,7 +89,6 @@ class InventoryController extends ChangeNotifier {
     agg.rssi = hit.rssi;
     agg.last = now;
 
-    // flush ~30fps agar UI tidak rebuild terlalu sering
     _flushTimer ??= Timer(const Duration(milliseconds: 32), _applyPending);
   }
 
@@ -96,7 +116,8 @@ class InventoryController extends ChangeNotifier {
   Future<void> start() async {
     if (_isRunning) return;
     _isRunning = true;
-    _startAt ??= DateTime.now();
+    _startAt = DateTime.now();
+    _firstHitAt = null;
     notifyListeners();
 
     try {
@@ -126,6 +147,7 @@ class InventoryController extends ChangeNotifier {
     _sorted.clear();
     _totalHits = 0;
     _startAt = null;
+    _firstHitAt = null;
     _dirty = true;
     notifyListeners();
   }

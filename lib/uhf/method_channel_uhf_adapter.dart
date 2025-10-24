@@ -15,8 +15,7 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   int _startedAtMs = 0;
   bool _rpcBusy = false;
 
-  // Timer tidak expose periode, simpan sendiri
-  Duration _period = const Duration(milliseconds: 20); // super cepat di awal
+  Duration _period = const Duration(milliseconds: 12);
   int _lastEventMs = 0;
 
   MethodChannelUhfAdapter({bool useEvents = true}) : _useEvents = useEvents {
@@ -26,11 +25,11 @@ class MethodChannelUhfAdapter implements UhfAdapter {
         if (e is List) {
           for (final it in e) {
             final hit = TagHitNative.fromAny(it);
-            if (hit.epc.isNotEmpty) _ctrl.add(hit);
+            if (hit.epc.isNotEmpty && _passRssi(hit.rssi)) _ctrl.add(hit);
           }
         } else {
           final hit = TagHitNative.fromAny(e);
-          if (hit.epc.isNotEmpty) _ctrl.add(hit);
+          if (hit.epc.isNotEmpty && _passRssi(hit.rssi)) _ctrl.add(hit);
         }
         _lastEventMs = now;
       }, onError: (_) {});
@@ -40,13 +39,25 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   @override
   Stream<TagHitNative> get stream => _ctrl.stream;
 
+  // filter RSSI: <4s longgar (>= -75), lalu normal (>= -60)
+  bool _passRssi(dynamic r) {
+    int val;
+    if (r is num)
+      val = r.toInt();
+    else {
+      final p = int.tryParse('$r') ?? -90;
+      val = (p > 0 && p <= 300) ? (-90 + (p * 60 ~/ 300)) : p;
+    }
+    final age = DateTime.now().millisecondsSinceEpoch - _startedAtMs;
+    final thr = age < 4000 ? -75 : -60;
+    return val >= thr;
+  }
+
   Duration _wantedPeriod() {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final age = now - _startedAtMs;
-    if (age < 1200)
-      return const Duration(milliseconds: 20); // 1.2s pertama agresif
-    if (age < 4000) return const Duration(milliseconds: 60); // stabilisasi
-    return const Duration(milliseconds: 120); // hemat
+    final age = DateTime.now().millisecondsSinceEpoch - _startedAtMs;
+    if (age < 1000) return const Duration(milliseconds: 12);
+    if (age < 3000) return const Duration(milliseconds: 40);
+    return const Duration(milliseconds: 100);
   }
 
   void _reschedIfNeeded() {
@@ -63,16 +74,14 @@ class MethodChannelUhfAdapter implements UhfAdapter {
     _pullTimer?.cancel();
     _startedAtMs = DateTime.now().millisecondsSinceEpoch;
 
-    // Start polling backup (EventChannel tetap jadi jalur utama)
     _reschedIfNeeded();
-    // Re-evaluate interval beberapa kali di awal supaya selalu optimal
     Timer.periodic(const Duration(milliseconds: 200), (t) {
       if (_pullTimer == null) {
         t.cancel();
         return;
       }
       _reschedIfNeeded();
-      if (DateTime.now().millisecondsSinceEpoch - _startedAtMs > 4500)
+      if (DateTime.now().millisecondsSinceEpoch - _startedAtMs > 3500)
         t.cancel();
     });
 
@@ -80,10 +89,9 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   }
 
   Future<void> _pullOnce() async {
-    // Jika event deras (<180ms), skip polling agar tidak membebani IPC
     if (_useEvents) {
       final now = DateTime.now().millisecondsSinceEpoch;
-      if (now - _lastEventMs < 180) return;
+      if (now - _lastEventMs < 120) return; // was 180
     }
     if (_rpcBusy) return;
     _rpcBusy = true;
@@ -92,14 +100,12 @@ class MethodChannelUhfAdapter implements UhfAdapter {
       if (res is List) {
         for (final it in res) {
           final hit = TagHitNative.fromAny(it);
-          if (hit.epc.isNotEmpty) _ctrl.add(hit);
+          if (hit.epc.isNotEmpty && _passRssi(hit.rssi)) _ctrl.add(hit);
         }
       } else if (res != null) {
         final hit = TagHitNative.fromAny(res);
-        if (hit.epc.isNotEmpty) _ctrl.add(hit);
+        if (hit.epc.isNotEmpty && _passRssi(hit.rssi)) _ctrl.add(hit);
       }
-    } catch (_) {
-      // biarkan, native tetap jalan
     } finally {
       _rpcBusy = false;
     }
@@ -122,11 +128,9 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   @override
   Future<void> setPower(int dbm) =>
       _method.invokeMethod('setPower', {'power': dbm});
-
   @override
   Future<void> setBeepEnabled(bool enabled) =>
       _method.invokeMethod('setBeep', {'enabled': enabled});
-
   @override
   Future<void> setVibrateEnabled(bool enabled) =>
       _method.invokeMethod('setVibrate', {'enabled': enabled});

@@ -1,9 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:rfid_03/inventory_controller.dart';
 import 'package:rfid_03/uhf/method_channel_uhf_adapter.dart';
-import 'inventory_controller.dart';
-import 'widgets/action_buttons.dart';
-import 'widgets/epc_table.dart';
-import 'widgets/info_card.dart';
+import 'package:rfid_03/widgets/epc_table.dart';
+import 'package:rfid_03/widgets/info_card.dart';
+import 'package:rfid_03/widgets/action_buttons.dart';
 
 void main() => runApp(const IUhfApp());
 
@@ -39,8 +40,13 @@ class _InventoryPageState extends State<InventoryPage> {
   @override
   void initState() {
     super.initState();
-    // PENTING: aktifkan event streaming supaya responsif
+    // Aktifkan event streaming supaya respon cepat
     ctrl = InventoryController(MethodChannelUhfAdapter(useEvents: true));
+    // Kirim state awal Beep/Vibrate ke Native
+    Future.microtask(() {
+      ctrl.setBeepEnabled(beepEnabled);
+      ctrl.setVibrateEnabled(vibrateEnabled);
+    });
   }
 
   @override
@@ -68,6 +74,7 @@ class _InventoryPageState extends State<InventoryPage> {
                   uniqueCount: ctrl.uniqueTagCount,
                   totalHits: ctrl.totalHitCount,
                   elapsedMs: ctrl.elapsedMilliseconds,
+                  firstHitSec: ctrl.firstHitSeconds,
                 ),
                 const SizedBox(height: 8),
                 Expanded(child: EpcTable(rows: ctrl.rows)),
@@ -98,8 +105,9 @@ class _InventoryPageState extends State<InventoryPage> {
                 ),
                 ActionButtons(
                   isRunning: ctrl.isRunning,
-                  onStart: ctrl.start,
-                  onStop: ctrl.stop,
+                  onStart: () =>
+                      ctrl.start(), // dibungkus (Future -> VoidCallback)
+                  onStop: () => ctrl.stop(),
                   onClear: ctrl.clear,
                 ),
               ],

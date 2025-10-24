@@ -1,6 +1,5 @@
 import 'dart:async';
 
-/// 1 hit/tag dari native
 class TagHitNative {
   final String epc;
   final int rssi; // dBm
@@ -9,30 +8,33 @@ class TagHitNative {
   factory TagHitNative.fromAny(dynamic e) {
     if (e == null) return TagHitNative('', -70);
 
+    String? epc;
+    int? raw;
+
     if (e is Map) {
-      String? epc =
+      epc =
           _asString(e['epc']) ??
           _asString(e['EPC']) ??
           _asString(e['Epc']) ??
           _parseEpcFromText(_asString(e['text']) ?? _asString(e['raw']));
-      final int rssi =
-          _asInt(e['rssi']) ??
-          _asInt(e['RSSI']) ??
+      raw =
           _asInt(e['rssiDbm']) ??
           _asInt(e['rssidBm']) ??
+          _asInt(e['rssi']) ??
+          _asInt(e['RSSI']) ??
           _asInt(e['readRssi']) ??
-          _parseRssiFromText(_asString(e['text']) ?? _asString(e['raw'])) ??
-          -70;
-      return TagHitNative(epc ?? '', rssi);
+          _parseRssiFromText(_asString(e['text']) ?? _asString(e['raw']));
+    } else if (e is String) {
+      epc = _parseEpcFromText(e);
+      raw = _parseRssiFromText(e);
+    } else {
+      epc = e.toString();
+      raw = -70;
     }
 
-    if (e is String) {
-      final epc = _parseEpcFromText(e) ?? '';
-      final rssi = _parseRssiFromText(e) ?? -70;
-      return TagHitNative(epc, rssi);
-    }
-
-    return TagHitNative(e.toString(), -70);
+    raw ??= -70;
+    final dbm = (raw > 0 && raw <= 300) ? (-90 + (raw * 60 ~/ 300)) : raw;
+    return TagHitNative(epc ?? '', dbm);
   }
 
   static String? _asString(dynamic v) {

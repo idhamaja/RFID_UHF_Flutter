@@ -41,6 +41,9 @@ android {
         resources {
             pickFirsts += listOf("**/*.so")
         }
+    jniLibs {
+      useLegacyPackaging = true
+    }
     }
 }
 
@@ -49,8 +52,7 @@ repositories { flatDir { dirs("lib") } }
 dependencies {
     // cara paling aman: refer langsung ke file
     implementation(files("lib/UHFJar_V1.4.06.aar"))
-    // atau: ambil semua .aar / .jar di folder libs
-    // implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar","*.jar"))))
+
 }
 
 flutter { source = "../.." }
