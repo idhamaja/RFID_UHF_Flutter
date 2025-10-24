@@ -28,6 +28,12 @@ import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodChannel;
 
+/**
+ * UHF Native Bridge (high-speed):
+ * - Continuous read + adaptive Q
+ * - 1..4 Hz "burst snapshot" (EPC unik per jendela)
+ * - Fallback drains (text/raw/bruteforce) untuk berbagai SDK
+ */
 public class MainActivity extends FlutterActivity {
 
   private static final String METHOD_CH = "uhf";
@@ -37,20 +43,25 @@ public class MainActivity extends FlutterActivity {
   // pacing & limits
   private static final int CACHE_LIMIT = 12000;
   private static final int PUSH_CHUNK = 256;
-  private static final int PUSH_GAP_MS = 4;
+  private static final int PUSH_GAP_MS = 3; // lebih rapat
   private static final int READER_IDLE_MS = 0;
   private static final int BEEP_GAP_MS = 200;
   private static final int VIB_GAP_MS = 240;
-  private static final int DUP_SUPPRESS_MS = 6;
+  private static final int DUP_SUPPRESS_MS = 4; // redup duplikat lebih agresif
   private static final int[] SERIAL_BAUD = new int[] { 921600, 460800, 230400, 115200 };
 
-  // fast start / snapshot window
-  private static final int FASTSTART_MS = 1800;
-  private static final int FIRST_HIT_DEADLINE_MS = 900;
+  // fast start
+  private static final int FASTSTART_MS = 1500;
+  private static final int FIRST_HIT_DEADLINE_MS = 800;
 
-  // RSSI gate
-  private static final int RSSI_FAST_DBM = -88;
-  private static final int RSSI_STEADY_DBM = -60;
+  // RSSI (dBm)
+  private static final int RSSI_FAST_DBM = -90; // longgar saat warmup
+  private static final int RSSI_STEADY_DBM = -62;
+
+  // burst config
+  private static final int BURST_MIN_MS = 220; // ~4.5 Hz maksimum
+  private static final int BURST_MAX_MS = 1000; // 1 Hz minimum
+  private static final float SNAPSHOT_WINDOW_RATIO = 0.86f; // porsi periode untuk kumpulkan EPC unik
 
   private boolean isBeepEnabled = false;
   private boolean isVibrateEnabled = false;
@@ -71,17 +82,16 @@ public class MainActivity extends FlutterActivity {
   private long lastPushAt = 0L;
   private boolean pushPosted = false;
 
-  private final LinkedHashMap<String, Long> recentEpc = new LinkedHashMap<String, Long>(512, 0.75f, true) {
+  private final LinkedHashMap<String, Long> recentEpc = new LinkedHashMap<String, Long>(1024, 0.75f, true) {
     @Override
     protected boolean removeEldestEntry(Map.Entry<String, Long> e) {
-      return size() > 2048;
+      return size() > 4096;
     }
   };
 
   private volatile boolean powered = false, opened = false, running = false;
 
   private Thread readerThread;
-  private boolean methodsDumped = false;
 
   private ToneGenerator toneGen;
   private long lastBeepAt = 0L, lastVibrateAt = 0L;
@@ -99,12 +109,28 @@ public class MainActivity extends FlutterActivity {
   private volatile boolean seenAny = false;
   private long firstSeenAt = 0L;
   private volatile int currentGateDbm = RSSI_FAST_DBM;
+
   private volatile boolean firstPushDone = false;
 
-  // full-scan snapshot
+  // snapshot / burst
   private volatile boolean fullScanMode = false;
   private long fullScanEndsAt = 0L;
   private final LinkedHashMap<String, Map<String, Object>> primeSet = new LinkedHashMap<>();
+
+  private volatile boolean burstEnabled = false;
+  private int burstMs = 1000;
+  private final Runnable burstTask = new Runnable() {
+    @Override
+    public void run() {
+      if (!running || !burstEnabled)
+        return;
+      if (!fullScanMode) {
+        int window = Math.max(180, (int) (burstMs * SNAPSHOT_WINDOW_RATIO));
+        beginFullScan(window);
+      }
+      main.postDelayed(this, burstMs);
+    }
+  };
 
   @Override
   public void configureFlutterEngine(@NonNull FlutterEngine engine) {
@@ -117,11 +143,27 @@ public class MainActivity extends FlutterActivity {
               case "startInventory": {
                 final Boolean full = call.argument("fullScan");
                 final Integer win = call.argument("windowMs");
+                final Number hz = call.argument("scanHz"); // boleh int/double
+
                 rpc.post(() -> {
                   try {
-                    if (Boolean.TRUE.equals(full))
-                      beginFullScan(win != null ? win : 1800);
-                    startInventory();
+                    // burst config (optional)
+                    if (Boolean.TRUE.equals(full)) {
+                      double targetHz = (hz == null ? 1.0 : hz.doubleValue());
+                      int period = (int) Math.round(1000.0 / Math.max(0.5, Math.min(4.5, targetHz)));
+                      burstMs = Math.max(BURST_MIN_MS, Math.min(BURST_MAX_MS, period));
+                      burstEnabled = true;
+                      main.removeCallbacks(burstTask);
+                      main.post(burstTask);
+
+                      int w = (win != null) ? win : (int) (burstMs * SNAPSHOT_WINDOW_RATIO);
+                      beginFullScan(w);
+                    } else {
+                      burstEnabled = false;
+                      main.removeCallbacks(burstTask);
+                    }
+
+                    startInventoryCore();
                   } catch (Throwable t) {
                     Log.e(TAG, "startInventory error", t);
                   }
@@ -129,8 +171,11 @@ public class MainActivity extends FlutterActivity {
                 result.success(null);
                 break;
               }
+
               case "stopInventory":
-                stopInventory();
+                burstEnabled = false;
+                main.removeCallbacks(burstTask);
+                stopInventoryCore();
                 result.success(null);
                 break;
 
@@ -154,17 +199,21 @@ public class MainActivity extends FlutterActivity {
                 result.success(null);
                 break;
               }
+
               case "setBeep":
                 isBeepEnabled = Boolean.TRUE.equals(call.argument("enabled"));
                 result.success(null);
                 break;
+
               case "setVibrate":
                 isVibrateEnabled = Boolean.TRUE.equals(call.argument("enabled"));
                 result.success(null);
                 break;
+
               case "ping":
                 result.success("pong:" + getPackageName());
                 break;
+
               default:
                 result.notImplemented();
             }
@@ -178,13 +227,11 @@ public class MainActivity extends FlutterActivity {
         .setStreamHandler(new EventChannel.StreamHandler() {
           @Override
           public void onListen(Object args, EventChannel.EventSink es) {
-            Log.d(TAG, "EVENT onListen");
             sink = es;
           }
 
           @Override
           public void onCancel(Object args) {
-            Log.d(TAG, "EVENT onCancel");
             sink = null;
           }
         });
@@ -198,13 +245,14 @@ public class MainActivity extends FlutterActivity {
     rpc = new Handler(rpcThread.getLooper());
   }
 
-  // ==== full-scan (snapshot) ====
+  /* ===================== FULL-SCAN SNAPSHOT ===================== */
+
   private void beginFullScan(int windowMs) {
     fullScanMode = true;
     synchronized (primeSet) {
       primeSet.clear();
     }
-    fullScanEndsAt = SystemClock.uptimeMillis() + Math.max(400, windowMs);
+    fullScanEndsAt = SystemClock.uptimeMillis() + Math.max(180, windowMs);
     main.postDelayed(this::finishFullScanIfDue, windowMs);
   }
 
@@ -233,6 +281,8 @@ public class MainActivity extends FlutterActivity {
     }
     firstPushDone = true;
   }
+
+  /* ===================== small utils ===================== */
 
   private void safeBeep() {
     if (!isBeepEnabled)
@@ -278,10 +328,10 @@ public class MainActivity extends FlutterActivity {
           tryCall(uhfMgr, "setTarget", (i & 1));
           if (i == 1 && tryCall(uhfFunc, "inventoryReset") == null) {
             invokeAny(uhfFunc, "inventoryStop");
-            Thread.sleep(60);
+            Thread.sleep(50);
             invokeAny(uhfFunc, "inventoryStart");
           }
-          Thread.sleep(80);
+          Thread.sleep(60);
         }
       } catch (Throwable ignore) {
       }
@@ -293,21 +343,21 @@ public class MainActivity extends FlutterActivity {
       long end = SystemClock.uptimeMillis() + ms;
       while (running && SystemClock.uptimeMillis() < end && !seenAny) {
         try {
-          Thread.sleep(50);
+          Thread.sleep(40);
         } catch (Throwable ignore) {
         }
       }
       if (!running || seenAny)
         return;
       try {
-        setMinRssiBoth(-75);
+        setMinRssiBoth(-78);
         configureRegionForBootstrap();
         if (tryCall(uhfFunc, "inventoryReset") == null) {
           invokeAny(uhfFunc, "inventoryStop");
-          Thread.sleep(120);
+          Thread.sleep(100);
           invokeAny(uhfFunc, "inventoryStart");
         }
-        startTargetNudge(SystemClock.uptimeMillis() + 1500);
+        startTargetNudge(SystemClock.uptimeMillis() + 1200);
       } catch (Throwable ignore) {
       }
     }, "uhf-deadline").start();
@@ -327,7 +377,9 @@ public class MainActivity extends FlutterActivity {
     return v;
   }
 
-  private void startInventory() throws Exception {
+  /* ===================== START/STOP CORE ===================== */
+
+  private void startInventoryCore() throws Exception {
     ensureReady();
 
     boolean started = invokeAny(uhfFunc, "startInventoryTag") ||
@@ -341,7 +393,7 @@ public class MainActivity extends FlutterActivity {
     fastStart = true;
     long now = SystemClock.uptimeMillis();
     fastStartEndsAt = now + FASTSTART_MS;
-    lastQAdjustAt = fastStartEndsAt;
+    lastQAdjustAt = now + 400; // adjust lebih cepat
     seenAny = false;
     firstSeenAt = 0L;
     firstPushDone = false;
@@ -356,12 +408,15 @@ public class MainActivity extends FlutterActivity {
     tryCall(uhfFunc, "setInventoryContinue", 1);
     tryCall(uhfMgr, "setInventoryContinue", 1);
 
+    // Prefer session S0 (lebih cepat) bila ada API
+    tryCall(uhfFunc, "setSession", 0);
+    tryCall(uhfMgr, "setSession", 0);
+
     rpc.post(() -> {
       try {
         tryRegisterCallbacks();
-        if (!methodsDumped) {
-          methodsDumped = true;
-        }
+
+        // phase 1: DynamicQ off, Q=0 (agresif)
         tryCall(uhfFunc, "setDynamicQ", false);
         tryCall(uhfMgr, "setDynamicQ", false);
         currentQ = 0;
@@ -370,9 +425,11 @@ public class MainActivity extends FlutterActivity {
         tryCall(uhfFunc, "SetQValue", currentQ);
         tryCall(uhfMgr, "SetQValue", currentQ);
 
-        configureRegionForBootstrap();
+        configureRegionForBootstrap(); // single channel sebentar
 
-        Thread.sleep(1500);
+        Thread.sleep(900);
+
+        // phase 2: dynamic on + RSSI gate normal
         tryCall(uhfFunc, "setDynamicQ", true);
         tryCall(uhfMgr, "setDynamicQ", true);
         setMinRssiBoth(RSSI_STEADY_DBM);
@@ -381,6 +438,26 @@ public class MainActivity extends FlutterActivity {
       } catch (Throwable ignore) {
       }
     });
+  }
+
+  private void stopInventoryCore() {
+    running = false;
+    fastStart = false;
+    stopTargetNudge();
+    main.removeCallbacks(burstTask);
+    if (readerThread != null) {
+      readerThread.interrupt();
+      readerThread = null;
+    }
+    try {
+      invokeAny(uhfFunc, "stopInventory");
+      invokeAny(uhfFunc, "inventoryStop");
+      invokeAny(uhfFunc, "stopRead");
+      invokeAny(uhfMgr, "stopInventory");
+      invokeAny(uhfMgr, "inventoryStop");
+      invokeAny(uhfMgr, "stopRead");
+    } catch (Throwable ignore) {
+    }
   }
 
   private void configureRegionForBootstrap() {
@@ -408,24 +485,7 @@ public class MainActivity extends FlutterActivity {
     tryCall(uhfMgr, "setHopping", true);
   }
 
-  private void stopInventory() {
-    running = false;
-    fastStart = false;
-    stopTargetNudge();
-    if (readerThread != null) {
-      readerThread.interrupt();
-      readerThread = null;
-    }
-    try {
-      invokeAny(uhfFunc, "stopInventory");
-      invokeAny(uhfFunc, "inventoryStop");
-      invokeAny(uhfFunc, "stopRead");
-      invokeAny(uhfMgr, "stopInventory");
-      invokeAny(uhfMgr, "inventoryStop");
-      invokeAny(uhfMgr, "stopRead");
-    } catch (Throwable ignore) {
-    }
-  }
+  /* ===================== READER LOOP ===================== */
 
   private void startReaderLoop() {
     if (readerThread != null)
@@ -436,14 +496,11 @@ public class MainActivity extends FlutterActivity {
       while (running) {
         try {
           int c = drainAllTagsOnce();
-          if (c == 0) {
-            // fallback mahal (log/raw/bruteforce) — penting untuk device yang tidak expose
-            // API "fast"
-            c = expensiveSweep();
-          }
+          if (c == 0)
+            c = expensiveSweep(); // fallback mahal tapi dipersempit intervalnya
           if (c == 0) {
             idleStreak = Math.min(idleStreak + 1, 200);
-            int extra = (idleStreak < 5) ? 0 : (idleStreak < 30) ? 1 : (idleStreak < 80) ? 2 : 3;
+            int extra = (idleStreak < 4) ? 0 : (idleStreak < 24) ? 1 : (idleStreak < 60) ? 2 : 3;
             int sleep = READER_IDLE_MS + extra;
             if (sleep > 0)
               Thread.sleep(sleep);
@@ -455,7 +512,7 @@ public class MainActivity extends FlutterActivity {
           break;
         } catch (Throwable t) {
           try {
-            Thread.sleep(8);
+            Thread.sleep(6);
           } catch (InterruptedException ie) {
             break;
           }
@@ -476,7 +533,7 @@ public class MainActivity extends FlutterActivity {
           int tgt = (t++ & 1);
           tryCall(uhfFunc, "setTarget", tgt);
           tryCall(uhfMgr, "setTarget", tgt);
-          Thread.sleep(50);
+          Thread.sleep(40);
         } catch (Throwable ignore) {
         }
       }
@@ -488,6 +545,8 @@ public class MainActivity extends FlutterActivity {
     targetLoop = false;
     targetThread = null;
   }
+
+  /* ===================== Hardware init ===================== */
 
   private void setPower(int dbm) {
     try {
@@ -654,8 +713,8 @@ public class MainActivity extends FlutterActivity {
 
   private void maybeAdjustQ() {
     long now = SystemClock.uptimeMillis();
-    if (now - lastQAdjustAt < 280)
-      return;
+    if (now - lastQAdjustAt < 200)
+      return; // lebih responsif
     lastQAdjustAt = now;
 
     int rate = hitsSinceLastAdjust;
@@ -668,18 +727,18 @@ public class MainActivity extends FlutterActivity {
     int newQ = currentQ;
     if (rate > 600)
       newQ = 6;
-    else if (rate > 220)
+    else if (rate > 240)
       newQ = Math.max(newQ, 5);
-    else if (rate > 90)
+    else if (rate > 100)
       newQ = Math.max(newQ, 4);
-    else if (rate < 30 && backlog < 80)
+    else if (rate < 35 && backlog < 80)
       newQ = 3;
 
-    if (backlog > 1800)
+    if (backlog > 1500)
       newQ = 6;
-    else if (backlog > 800)
+    else if (backlog > 700)
       newQ = Math.max(newQ, 5);
-    else if (backlog > 300)
+    else if (backlog > 260)
       newQ = Math.max(newQ, 4);
 
     if (newQ != currentQ) {
@@ -736,7 +795,7 @@ public class MainActivity extends FlutterActivity {
           backlogAfter = tagCache.size();
         }
         long now1 = SystemClock.uptimeMillis();
-        if (batch.size() < 8 && backlogAfter > 600 && now1 - lastNudgeAt > 450) {
+        if (batch.size() < 8 && backlogAfter > 500 && now1 - lastNudgeAt > 380) {
           lastNudgeAt = now1;
           rpc.post(() -> {
             try {
@@ -756,7 +815,8 @@ public class MainActivity extends FlutterActivity {
     }, delay);
   }
 
-  // ====== drains ======
+  /* ===================== drains ===================== */
+
   private int drainAllTagsOnce() {
     int c = 0;
     c += drainBySinglePop(uhfFunc);
@@ -810,11 +870,10 @@ public class MainActivity extends FlutterActivity {
     return c;
   }
 
-  // *** NEW: fallback mahal untuk device yang hanya expose log/raw ***
   private int expensiveSweep() {
     long now = SystemClock.uptimeMillis();
-    if (now - lastExpensivePollAt < 90)
-      return 0; // rate limit
+    if (now - lastExpensivePollAt < 60)
+      return 0; // lebih sering
     lastExpensivePollAt = now;
 
     int c = 0;
@@ -950,7 +1009,7 @@ public class MainActivity extends FlutterActivity {
       return out;
 
     long now = SystemClock.uptimeMillis();
-    if (now - lastExpensivePollAt < 100)
+    if (now - lastExpensivePollAt < 80)
       return out;
     lastExpensivePollAt = now;
 
@@ -1112,7 +1171,6 @@ public class MainActivity extends FlutterActivity {
     publishTagFromMap(map);
   }
 
-  // versi yang langsung menerima map agar tidak parsing dua kali
   private void publishTagFromMap(Map<String, Object> map) {
     if (!seenAny) {
       seenAny = true;
@@ -1124,7 +1182,7 @@ public class MainActivity extends FlutterActivity {
       synchronized (primeSet) {
         primeSet.put(epc, map);
       }
-      return; // snapshot akan dikirim sekaligus
+      return; // ditahan dulu, kirim serentak saat window selesai
     }
 
     if (!firstPushDone) {
@@ -1174,6 +1232,8 @@ public class MainActivity extends FlutterActivity {
     }
     return snap;
   }
+
+  /* ===================== parsing ===================== */
 
   private static String parseHexFromText(String s) {
     if (s == null)
@@ -1250,6 +1310,8 @@ public class MainActivity extends FlutterActivity {
     return null;
   }
 
+  /* ===================== reflect helpers ===================== */
+
   private Method findMethod(Object target, String name, int paramCount) {
     if (target == null)
       return null;
@@ -1301,7 +1363,7 @@ public class MainActivity extends FlutterActivity {
   @Override
   protected void onDestroy() {
     try {
-      stopInventory();
+      stopInventoryCore();
     } catch (Throwable ignore) {
     }
     try {
