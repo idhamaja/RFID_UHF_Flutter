@@ -70,7 +70,9 @@ class TagHitNative {
 
 abstract class UhfAdapter {
   Stream<TagHitNative> get stream;
-  Future<void> startInventory();
+
+  /// fullScan=true -> native kumpulkan EPC selama [fullScanMs] lalu kirim 1 batch besar
+  Future<void> startInventory({bool fullScan = false, int fullScanMs = 1800});
   Future<void> stopInventory();
   Future<void> dispose();
   Future<void> setPower(int dbm);

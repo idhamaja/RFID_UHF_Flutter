@@ -61,18 +61,10 @@ class InventoryController extends ChangeNotifier {
       ? 0
       : DateTime.now().difference(_startAt!).inMilliseconds;
 
-  int get elapsedSeconds => (elapsedMilliseconds / 1000).floor();
-
-  int get firstHitMilliseconds => (_startAt == null || _firstHitAt == null)
-      ? 0
-      : _firstHitAt!.difference(_startAt!).inMilliseconds;
-
-  /// First hit (dibulatkan ke atas agar tidak 0 s)
   int get firstHitSeconds {
-    final ms = firstHitMilliseconds;
-    if (ms <= 0) return 0;
-    return (ms / 1000).ceil();
-    // Jika ingin lebih presisi: return (ms / 1000).clamp(0, double.infinity).ceil();
+    if (_startAt == null || _firstHitAt == null) return 0;
+    final ms = _firstHitAt!.difference(_startAt!).inMilliseconds;
+    return ms <= 0 ? 0 : (ms / 1000).ceil();
   }
 
   void _onTagHit(TagHitNative hit) {
@@ -89,7 +81,7 @@ class InventoryController extends ChangeNotifier {
     agg.rssi = hit.rssi;
     agg.last = now;
 
-    _flushTimer ??= Timer(const Duration(milliseconds: 32), _applyPending);
+    _flushTimer ??= Timer(const Duration(milliseconds: 24), _applyPending);
   }
 
   void _applyPending() {
@@ -122,7 +114,8 @@ class InventoryController extends ChangeNotifier {
 
     try {
       await adapter.setPower(30);
-      await adapter.startInventory();
+      // Snapshot 2 detik biar langsung “full list”
+      await adapter.startInventory(fullScan: true, fullScanMs: 2000);
     } catch (_) {
       _isRunning = false;
       notifyListeners();

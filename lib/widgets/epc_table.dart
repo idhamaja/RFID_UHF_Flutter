@@ -46,8 +46,8 @@ class EpcTable extends StatelessWidget {
                   return const Center(child: Text('Belum ada tag terbaca'));
                 }
                 return ListView.builder(
-                  primary: false, // <- penting: selalu false
-                  shrinkWrap: unbounded, // true hanya jika unbounded
+                  primary: false,
+                  shrinkWrap: unbounded,
                   physics: const AlwaysScrollableScrollPhysics(),
                   controller: controller,
                   itemExtent: rowHeight,
@@ -59,7 +59,7 @@ class EpcTable extends StatelessWidget {
                   itemBuilder: (context, index) {
                     final row = data[index];
                     final alt = (index & 1) == 1;
-                    final int rssiDisplay = row.lastRssi.clamp(-60, -30);
+                    final int rssiDisplay = row.lastRssi.clamp(-85, -30);
                     return Container(
                       key: ValueKey(row.epc),
                       color: alt ? Colors.grey.shade50 : Colors.white,

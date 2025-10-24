@@ -8,15 +8,16 @@ class MethodChannelUhfAdapter implements UhfAdapter {
 
   final _ctrl = StreamController<TagHitNative>.broadcast();
   final bool _useEvents;
-
   StreamSubscription? _eventSub;
 
   Timer? _pullTimer;
   int _startedAtMs = 0;
   bool _rpcBusy = false;
 
-  Duration _period = const Duration(milliseconds: 12);
+  Duration _period = const Duration(milliseconds: 8);
   int _lastEventMs = 0;
+
+  bool _lastStartWasFull = false;
 
   MethodChannelUhfAdapter({bool useEvents = true}) : _useEvents = useEvents {
     if (_useEvents) {
@@ -39,25 +40,24 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   @override
   Stream<TagHitNative> get stream => _ctrl.stream;
 
-  // filter RSSI: <4s longgar (>= -75), lalu normal (>= -60)
   bool _passRssi(dynamic r) {
     int val;
-    if (r is num)
+    if (r is num) {
       val = r.toInt();
-    else {
+    } else {
       final p = int.tryParse('$r') ?? -90;
       val = (p > 0 && p <= 300) ? (-90 + (p * 60 ~/ 300)) : p;
     }
     final age = DateTime.now().millisecondsSinceEpoch - _startedAtMs;
-    final thr = age < 4000 ? -75 : -60;
+    final thr = age < 4000 ? -85 : -60; // longgar di awal
     return val >= thr;
   }
 
   Duration _wantedPeriod() {
     final age = DateTime.now().millisecondsSinceEpoch - _startedAtMs;
-    if (age < 1000) return const Duration(milliseconds: 12);
-    if (age < 3000) return const Duration(milliseconds: 40);
-    return const Duration(milliseconds: 100);
+    if (age < 1000) return const Duration(milliseconds: 8);
+    if (age < 3000) return const Duration(milliseconds: 28);
+    return const Duration(milliseconds: 80);
   }
 
   void _reschedIfNeeded() {
@@ -70,12 +70,17 @@ class MethodChannelUhfAdapter implements UhfAdapter {
   }
 
   @override
-  Future<void> startInventory() async {
+  Future<void> startInventory({
+    bool fullScan = false,
+    int fullScanMs = 1800,
+  }) async {
     _pullTimer?.cancel();
     _startedAtMs = DateTime.now().millisecondsSinceEpoch;
+    _lastStartWasFull = fullScan;
 
     _reschedIfNeeded();
-    Timer.periodic(const Duration(milliseconds: 200), (t) {
+    // auto-reschedule di awal beberapa detik
+    Timer.periodic(const Duration(milliseconds: 160), (t) {
       if (_pullTimer == null) {
         t.cancel();
         return;
@@ -85,13 +90,20 @@ class MethodChannelUhfAdapter implements UhfAdapter {
         t.cancel();
     });
 
-    await _method.invokeMethod('startInventory');
+    await _method.invokeMethod('startInventory', {
+      'fullScan': fullScan,
+      'windowMs': fullScanMs,
+    });
+
+    // Warm-up pull hanya untuk mode streaming
+    if (!fullScan) unawaited(_pullOnce());
   }
 
   Future<void> _pullOnce() async {
+    if (_lastStartWasFull) return; // snapshot dikirim via event
     if (_useEvents) {
       final now = DateTime.now().millisecondsSinceEpoch;
-      if (now - _lastEventMs < 120) return; // was 180
+      if (now - _lastEventMs < 60) return;
     }
     if (_rpcBusy) return;
     _rpcBusy = true;

@@ -1,10 +1,7 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:rfid_03/inventory_controller.dart';
 import 'package:rfid_03/uhf/method_channel_uhf_adapter.dart';
 import 'package:rfid_03/widgets/epc_table.dart';
-import 'package:rfid_03/widgets/info_card.dart';
-import 'package:rfid_03/widgets/action_buttons.dart';
 
 void main() => runApp(const IUhfApp());
 
@@ -40,12 +37,10 @@ class _InventoryPageState extends State<InventoryPage> {
   @override
   void initState() {
     super.initState();
-    // Aktifkan event streaming supaya respon cepat
     ctrl = InventoryController(MethodChannelUhfAdapter(useEvents: true));
-    // Kirim state awal Beep/Vibrate ke Native
-    Future.microtask(() {
-      ctrl.setBeepEnabled(beepEnabled);
-      ctrl.setVibrateEnabled(vibrateEnabled);
+    Future.microtask(() async {
+      await ctrl.setBeepEnabled(beepEnabled);
+      await ctrl.setVibrateEnabled(vibrateEnabled);
     });
   }
 
@@ -70,11 +65,14 @@ class _InventoryPageState extends State<InventoryPage> {
             padding: const EdgeInsets.all(8.0),
             child: Column(
               children: [
-                InfoCard(
-                  uniqueCount: ctrl.uniqueTagCount,
-                  totalHits: ctrl.totalHitCount,
-                  elapsedMs: ctrl.elapsedMilliseconds,
-                  firstHitSec: ctrl.firstHitSeconds,
+                Row(
+                  children: [
+                    _chip('Tag Population', '${ctrl.uniqueTagCount}'),
+                    const SizedBox(width: 8),
+                    _chip('Total Hits', '${ctrl.totalHitCount}'),
+                    const SizedBox(width: 8),
+                    _chip('First hit', '${ctrl.firstHitSeconds}s'),
+                  ],
                 ),
                 const SizedBox(height: 8),
                 Expanded(child: EpcTable(rows: ctrl.rows)),
@@ -85,9 +83,9 @@ class _InventoryPageState extends State<InventoryPage> {
                       child: SwitchListTile(
                         title: const Text("Beep"),
                         value: beepEnabled,
-                        onChanged: (val) {
-                          setState(() => beepEnabled = val);
-                          ctrl.setBeepEnabled(val);
+                        onChanged: (v) {
+                          setState(() => beepEnabled = v);
+                          ctrl.setBeepEnabled(v);
                         },
                       ),
                     ),
@@ -95,25 +93,81 @@ class _InventoryPageState extends State<InventoryPage> {
                       child: SwitchListTile(
                         title: const Text("Vibrate"),
                         value: vibrateEnabled,
-                        onChanged: (val) {
-                          setState(() => vibrateEnabled = val);
-                          ctrl.setVibrateEnabled(val);
+                        onChanged: (v) {
+                          setState(() => vibrateEnabled = v);
+                          ctrl.setVibrateEnabled(v);
                         },
                       ),
                     ),
                   ],
                 ),
-                ActionButtons(
-                  isRunning: ctrl.isRunning,
-                  onStart: () =>
-                      ctrl.start(), // dibungkus (Future -> VoidCallback)
-                  onStop: () => ctrl.stop(),
-                  onClear: ctrl.clear,
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: ctrl.isRunning ? null : ctrl.start,
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.all(14),
+                        ),
+                        child: const Text('START'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: ctrl.isRunning ? ctrl.stop : null,
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.all(14),
+                        ),
+                        child: const Text('STOP'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: ctrl.clear,
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.all(14),
+                        ),
+                        child: const Text('CLEAR'),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
           );
         },
+      ),
+    );
+  }
+
+  Widget _chip(String title, String value) {
+    return Expanded(
+      child: Container(
+        height: 64,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
       ),
     );
   }
